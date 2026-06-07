@@ -11,22 +11,48 @@ import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
-# ─── Import core agent ────────────────────────────────────────────────────────
-# The agent module is extracted from the notebook as a standalone importable.
-# If running from the project root, koswatt_agent.py must be present.
-from koswatt_agent import core_koswatt_agent
+from koswatt_agent import (
+    core_koswatt_agent,
+    AC_ECO_THRESHOLD,
+    AC_ECO_WATTS,
+    AC_HOT_WATTS,
+    AC_COOL_WATTS,
+    LAMP_WATTS,
+    TV_WATTS,
+    STANDBY_WATTS,
+)
+
+# ── Human-readable labels ─────────────────────────────────────────────────────
+ACTION_LABELS = {
+    'TURN_OFF_TV'    : 'Turn off TV',
+    'TURN_OFF_LAMP'  : 'Turn off lamp',
+    'TURN_OFF_AC'    : 'Turn off AC unit',
+    'TURN_OFF_AC_ECO': 'Turn off AC unit (was in ECO mode)',
+    'SET_AC_TO_ECO'  : 'Set AC to ECO mode',
+}
+ADVISORY_LABELS = {
+    'SUGGEST_AC_ECO'   : 'Switch AC to ECO mode',
+    'SUGGEST_LAMP_OFF' : 'Consider turning off the lamp',
+}
 
 
-# ─── Page configuration ───────────────────────────────────────────────────────
+# ── Page configuration ────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title  = "KosWatt | Smart Energy AI",
-    page_icon   = "W",
-    layout      = "wide",
+    page_title            = "KosWatt | Smart Energy AI",
+    page_icon             = "W",
+    layout                = "wide",
     initial_sidebar_state = "expanded"
 )
 
 
-# ─── Global styles ────────────────────────────────────────────────────────────
+# ── Session state initialisation ──────────────────────────────────────────────
+if 'log' not in st.session_state:
+    st.session_state.log = []
+if 'last_log_hash' not in st.session_state:
+    st.session_state.last_log_hash = None
+
+
+# ── Global styles ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
@@ -176,6 +202,21 @@ st.markdown("""
         border-radius: 4px;
         padding: 1.5rem 2rem;
     }
+    .panel-advisory {
+        background: #0d1520;
+        border: 1px solid #1a2d40;
+        border-left: 4px solid #38bdf8;
+        border-radius: 4px;
+        padding: 1.2rem 2rem;
+        margin-top: 1rem;
+    }
+    .panel-reasoning {
+        background: #111111;
+        border: 1px solid #1e1e1e;
+        border-left: 4px solid #333333;
+        border-radius: 4px;
+        padding: 1.5rem 2rem;
+    }
     .panel-title {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.75rem;
@@ -184,21 +225,54 @@ st.markdown("""
         margin-bottom: 1rem;
     }
 
-    /* ── Action list ── */
+    /* ── Action list (HIGH WASTE) ── */
     .action-item {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.9rem;
         color: #f87171;
-        padding: 6px 0;
+        padding: 7px 0;
         border-bottom: 1px solid #2a1a1a;
         display: flex;
         align-items: center;
         gap: 10px;
     }
+    .action-item:last-child {
+        border-bottom: none;
+    }
     .action-index {
         color: #444;
         font-size: 0.75rem;
         min-width: 20px;
+    }
+
+    /* ── Advisory action list (MEDIUM WASTE) ── */
+    .advisory-item {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.85rem;
+        color: #38bdf8;
+        padding: 7px 0;
+        border-bottom: 1px solid #1a2d40;
+        line-height: 1.5;
+    }
+    .advisory-item:last-child {
+        border-bottom: none;
+    }
+    .advisory-note {
+        font-size: 0.75rem;
+        color: #4a7a99;
+        margin-top: 2px;
+    }
+
+    /* ── Reasoning lines ── */
+    .reasoning-line {
+        font-size: 0.875rem;
+        color: #888888;
+        padding: 10px 0;
+        border-bottom: 1px solid #1a1a1a;
+        line-height: 1.65;
+    }
+    .reasoning-line:last-child {
+        border-bottom: none;
     }
 
     /* ── Watt delta display ── */
@@ -241,11 +315,33 @@ st.markdown("""
         border-bottom: 1px solid #1e1e1e;
         padding-bottom: 6px;
     }
+
+    /* ── Session stats (sidebar) ── */
+    .stat-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 5px 0;
+        border-bottom: 1px solid #1a1a1a;
+    }
+    .stat-row:last-child {
+        border-bottom: none;
+    }
+    .stat-label {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem;
+        color: #444;
+    }
+    .stat-value {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem;
+        color: #aaa;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── Header ───────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="kw-header">
     <p class="kw-title">KosWatt</p>
@@ -254,10 +350,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ─── Sidebar: Simulation Controls ─────────────────────────────────────────────
+# ── Sidebar: Simulation Controls ──────────────────────────────────────────────
 with st.sidebar:
-    st.markdown('<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem; font-weight:600; color:#fff; margin-bottom:4px;">Simulation Control</p>', unsafe_allow_html=True)
-    st.markdown('<p style="font-size:0.75rem; color:#555; margin-bottom:1.5rem;">Configure room parameters to test the AI agent</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
+        ' font-weight:600; color:#fff; margin-bottom:4px;">Simulation Control</p>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<p style="font-size:0.75rem; color:#555; margin-bottom:1.5rem;">'
+        'Configure room parameters to test the AI agent</p>',
+        unsafe_allow_html=True
+    )
 
     st.markdown('<p class="sidebar-section">Room State</p>', unsafe_allow_html=True)
 
@@ -283,19 +387,54 @@ with st.sidebar:
     st.markdown('<p class="sidebar-section">Device Switch State</p>', unsafe_allow_html=True)
     st.caption("Initial state before AI intervention")
 
-    status_ac   = st.toggle("AC Unit",  value=True)
-    status_lamp = st.toggle("Lamp",     value=False)
-    status_tv   = st.toggle("TV",       value=True)
+    status_ac   = st.toggle("AC Unit", value=True)
+    status_ac_eco = st.toggle("AC in ECO mode", value=False, disabled=not status_ac)
+    status_lamp = st.toggle("Lamp",    value=False)
+    status_tv   = st.toggle("TV",      value=True)
+
+    # ── Session stats ─────────────────────────────────────────────────────────
+    st.markdown('<p class="sidebar-section">Session Stats</p>', unsafe_allow_html=True)
+
+    log = st.session_state.log
+    total_readings  = len(log)
+    high_events     = sum(1 for e in log if e['waste_category'] == 'HIGH WASTE')
+    medium_events   = sum(1 for e in log if e['waste_category'] == 'MEDIUM WASTE')
+    avg_saved_watts = (
+        round(sum(e['watt_saved'] for e in log if e['waste_category'] == 'HIGH WASTE') / high_events)
+        if high_events else 0
+    )
+
+    st.markdown(f"""
+    <div style="padding: 4px 0;">
+        <div class="stat-row">
+            <span class="stat-label">Readings</span>
+            <span class="stat-value">{total_readings}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">High waste events</span>
+            <span class="stat-value">{high_events}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Medium waste events</span>
+            <span class="stat-value">{medium_events}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Avg W saved per action</span>
+            <span class="stat-value">{avg_saved_watts} W</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
-# ─── Core computation ─────────────────────────────────────────────────────────
+# ── Core computation ──────────────────────────────────────────────────────────
 result = core_koswatt_agent(
-    occupancy   = occupancy,
-    temperature = temperature,
-    time_of_day = time_of_day,
-    status_ac   = status_ac,
-    status_lamp = status_lamp,
-    status_tv   = status_tv
+    occupancy    = occupancy,
+    temperature  = temperature,
+    time_of_day  = time_of_day,
+    status_ac    = status_ac,
+    status_lamp  = status_lamp,
+    status_tv    = status_tv,
+    status_ac_eco = status_ac_eco
 )
 
 fuzzy_score    = result['fuzzy_score']
@@ -304,16 +443,28 @@ action_seq     = result['action_sequence']
 initial_watt   = result['initial_watt']
 final_state    = result['final_state']
 final_watt     = result['final_watt']
+medium_recs    = result['medium_recommendations']
+reasoning      = result['reasoning']
 
 
-# ─── Gauge chart builder ──────────────────────────────────────────────────────
+# ── Session logging (deduplicated by input hash) ──────────────────────────────
+current_hash = (occupancy, temperature, time_of_day, status_ac, status_ac_eco, status_lamp, status_tv)
+if current_hash != st.session_state.last_log_hash:
+    st.session_state.last_log_hash = current_hash
+    st.session_state.log.append({
+        'waste_category': waste_category,
+        'initial_watt'  : initial_watt,
+        'final_watt'    : final_watt,
+        'watt_saved'    : initial_watt - final_watt,
+        'fuzzy_score'   : fuzzy_score,
+    })
+    if len(st.session_state.log) > 100:
+        st.session_state.log = st.session_state.log[-100:]
+        total_readings = "100+"
+
+
+# ── Gauge chart builder ───────────────────────────────────────────────────────
 def build_gauge(score):
-    """
-    Plotly Gauge chart with three color zones:
-      0-35  : Green  (Low waste)
-      35-65 : Amber  (Medium waste)
-      65-100: Red    (High waste)
-    """
     if score <= 35:
         needle_color = "#4ade80"
     elif score <= 65:
@@ -322,10 +473,10 @@ def build_gauge(score):
         needle_color = "#f87171"
 
     fig = go.Figure(go.Indicator(
-        mode  = "gauge+number",
-        value = score,
+        mode   = "gauge+number",
+        value  = score,
         number = {
-            'font' : {'size': 40, 'family': 'IBM Plex Mono', 'color': '#ffffff'},
+            'font'  : {'size': 40, 'family': 'IBM Plex Mono', 'color': '#ffffff'},
             'suffix': ''
         },
         gauge = {
@@ -339,18 +490,17 @@ def build_gauge(score):
             'bgcolor'   : '#141414',
             'borderwidth': 0,
             'steps'     : [
-                {'range': [0, 35],  'color': '#0d1f0d'},
-                {'range': [35, 65], 'color': '#1f1a0d'},
-                {'range': [65, 100],'color': '#1f0d0d'},
+                {'range': [0,   35],  'color': '#0d1f0d'},
+                {'range': [35,  65],  'color': '#1f1a0d'},
+                {'range': [65, 100],  'color': '#1f0d0d'},
             ],
             'threshold' : {
-                'line' : {'color': '#555', 'width': 2},
+                'line'     : {'color': '#555', 'width': 2},
                 'thickness': 0.75,
-                'value': 65
+                'value'    : 65
             }
         }
     ))
-
     fig.update_layout(
         paper_bgcolor = '#141414',
         plot_bgcolor  = '#141414',
@@ -361,7 +511,7 @@ def build_gauge(score):
     return fig
 
 
-# ─── Device status HTML builder ───────────────────────────────────────────────
+# ── Device status HTML builder ────────────────────────────────────────────────
 def device_pill(label, is_on, is_eco=False):
     if is_eco:
         badge = '<span class="pill-eco">ECO</span>'
@@ -372,10 +522,13 @@ def device_pill(label, is_on, is_eco=False):
     return f'<div class="device-row">{badge} <span style="color:#aaa">{label}</span></div>'
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ROW 1: Current Conditions (Before AI)
-# ═══════════════════════════════════════════════════════════════════════════════
-st.markdown('<p class="section-label">01 &nbsp; Current Conditions &nbsp; / &nbsp; Before AI Intervention</p>', unsafe_allow_html=True)
+# =============================================================================
+# ROW 01 -- Current Conditions / Before AI Intervention
+# =============================================================================
+st.markdown(
+    '<p class="section-label">01 &nbsp; Current Conditions &nbsp; / &nbsp; Before AI Intervention</p>',
+    unsafe_allow_html=True
+)
 
 col_a, col_b, col_c = st.columns([1, 1, 1.6])
 
@@ -392,22 +545,49 @@ with col_a:
 
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    # Context summary
-    occ_text  = "Occupied" if occupancy else "Empty"
-    tod_text  = "Night" if time_of_day else "Day"
+    occ_text = "Occupied" if occupancy else "Empty"
+    tod_text = "Night"    if time_of_day else "Day"
+
+    # Build per-device watt breakdown for the context card
+    ac_draw = AC_ECO_WATTS if (status_ac and status_ac_eco) else (
+              AC_HOT_WATTS if (status_ac and temperature > 30) else
+              AC_COOL_WATTS if status_ac else 0)
+    lamp_draw    = LAMP_WATTS if status_lamp else 0
+    tv_draw      = TV_WATTS   if status_tv   else 0
+    standby_draw = STANDBY_WATTS
+
+    def watt_row(label, watts):
+        color = "#aaa" if watts > 0 else "#333"
+        return (f'<div style="display:flex; justify-content:space-between; '
+                f'padding:3px 0; border-bottom:1px solid #1a1a1a;">'
+                f'<span style="color:#555; font-size:0.75rem;">{label}</span>'
+                f'<span style="font-family:IBM Plex Mono,monospace; font-size:0.75rem; color:{color};">'
+                f'{watts} W</span></div>')
+
+    breakdown_html = (
+        watt_row("AC", ac_draw) +
+        watt_row("Lamp", lamp_draw) +
+        watt_row("TV", tv_draw) +
+        watt_row("Standby", standby_draw)
+    )
+
     st.markdown(f"""
     <div class="metric-card">
         <div class="metric-label">Context</div>
-        <div style="font-family: IBM Plex Mono, monospace; font-size: 0.85rem; line-height: 2; color: #aaa;">
+        <div style="font-family: IBM Plex Mono, monospace; font-size: 0.85rem; line-height: 2; color: #aaa; margin-bottom: 0.8rem;">
             Room: <span style="color:#fff">{occ_text}</span><br>
             Temp: <span style="color:#fff">{temperature} C</span><br>
             Time: <span style="color:#fff">{tod_text}</span>
+        </div>
+        <div style="border-top: 1px solid #1e1e1e; padding-top: 0.6rem;">
+            <div style="font-size:0.65rem; letter-spacing:1.5px; color:#444; text-transform:uppercase; margin-bottom:6px;">Draw Breakdown</div>
+            {breakdown_html}
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 with col_b:
-    ac_state   = device_pill("AC Unit", status_ac)
+    ac_state   = device_pill("AC Unit", status_ac, is_eco=(status_ac and status_ac_eco))
     lamp_state = device_pill("Lamp",    status_lamp)
     tv_state   = device_pill("TV",      status_tv)
     st.markdown(f"""
@@ -421,7 +601,6 @@ with col_c:
     st.markdown('<div class="metric-card"><div class="metric-label">Waste Score</div>', unsafe_allow_html=True)
     st.plotly_chart(build_gauge(fuzzy_score), use_container_width=True, config={'displayModeBar': False})
 
-    # Category badge under gauge
     if waste_category == 'HIGH WASTE':
         badge_style = "background:#2a0000; color:#f87171; border:1px solid #5a2020;"
     elif waste_category == 'MEDIUM WASTE':
@@ -440,32 +619,36 @@ with col_c:
 
 st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ROW 2: After AI Automation
-# ═══════════════════════════════════════════════════════════════════════════════
-st.markdown('<p class="section-label">02 &nbsp; After AI Automation &nbsp; / &nbsp; Agent Decision</p>', unsafe_allow_html=True)
+
+# =============================================================================
+# ROW 02 -- After AI Automation / Agent Decision
+# =============================================================================
+st.markdown(
+    '<p class="section-label">02 &nbsp; After AI Automation &nbsp; / &nbsp; Agent Decision</p>',
+    unsafe_allow_html=True
+)
 
 if waste_category == 'LOW WASTE':
-    # ── Stable: no action needed ──────────────────────────────────────────────
     st.markdown(f"""
     <div class="panel-stable">
         <p class="panel-title" style="color:#4ade80">System Stable</p>
         <p style="font-size:0.95rem; color:#aaa; margin:0;">
-            Waste score <strong style="color:#4ade80">{fuzzy_score}</strong> is within acceptable range.
-            No automation action required. All devices operating within ethical parameters.
+            Waste score <strong style="color:#4ade80">{fuzzy_score}</strong> is within
+            acceptable range. No automation action required. All devices operating
+            within ethical parameters.
         </p>
     </div>
     """, unsafe_allow_html=True)
 
 elif waste_category == 'MEDIUM WASTE':
-    # ── Medium: monitoring, no intervention ───────────────────────────────────
     st.markdown(f"""
     <div class="panel-medium">
         <p class="panel-title" style="color:#fbbf24">Ethical Tolerance Active</p>
         <p style="font-size:0.95rem; color:#aaa; margin:0 0 0.8rem;">
             Waste score <strong style="color:#fbbf24">{fuzzy_score}</strong>.
-            Fuzzy guardrails detected contextual justification (thermal comfort or safety lighting).
-            Autonomous intervention withheld.
+            Fuzzy guardrails detected contextual justification for continued device
+            operation (thermal comfort or safety lighting). Autonomous intervention
+            withheld.
         </p>
         <p style="font-size: 0.8rem; color: #666; margin:0; font-family: IBM Plex Mono, monospace;">
             MONITORING &nbsp; | &nbsp; No STRIPS plan triggered
@@ -473,18 +656,54 @@ elif waste_category == 'MEDIUM WASTE':
     </div>
     """, unsafe_allow_html=True)
 
+    # Advisory recommendations panel (non-binding)
+    if medium_recs:
+        advisory_items_html = ""
+        for rec in medium_recs:
+            label = ADVISORY_LABELS.get(rec, rec)
+            if rec == 'SUGGEST_AC_ECO':
+                current_ac_watts = AC_HOT_WATTS if temperature > 30 else AC_COOL_WATTS
+                ac_saving        = current_ac_watts - AC_ECO_WATTS
+                advisory_items_html += f"""
+                <div class="advisory-item">
+                    {label}
+                    <div class="advisory-note">
+                        Would reduce AC draw by approximately {ac_saving} W.
+                        Advisory only -- no autonomous action executed.
+                    </div>
+                </div>"""
+            elif rec == 'SUGGEST_LAMP_OFF':
+                advisory_items_html += f"""
+                <div class="advisory-item">
+                    {label}
+                    <div class="advisory-note">
+                        Lamp draw is {LAMP_WATTS} W. Safety and deterrence
+                        justification applies at night; shutoff is not
+                        mandatory. Advisory only -- no autonomous action executed.
+                    </div>
+                </div>"""
+
+        st.markdown(f"""
+        <div class="panel-advisory">
+            <p class="panel-title" style="color:#38bdf8; margin-bottom:0.8rem;">
+                Non-Binding Recommendations
+            </p>
+            {advisory_items_html}
+        </div>
+        """, unsafe_allow_html=True)
+
 else:
-    # ── High waste: STRIPS triggered ─────────────────────────────────────────
+    # HIGH WASTE: STRIPS planner triggered
     col_left, col_right = st.columns([1.2, 1])
 
     with col_left:
-        # Action sequence list
         actions_html = ""
         for i, action in enumerate(action_seq, 1):
+            label = ACTION_LABELS.get(action, action)
             actions_html += f"""
             <div class="action-item">
                 <span class="action-index">{i:02d}</span>
-                <span>{action}</span>
+                <span>{label}</span>
             </div>"""
 
         if not action_seq:
@@ -493,7 +712,8 @@ else:
         st.markdown(f"""
         <div class="panel-alert">
             <p class="panel-title" style="color:#f87171">AI Action Triggered</p>
-            <p style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem; color:#666; margin-bottom:1rem;">
+            <p style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem;
+                      color:#666; margin-bottom:1rem;">
                 STRIPS PLANNER &nbsp; | &nbsp; {len(action_seq)} action(s) queued
             </p>
             {actions_html}
@@ -501,11 +721,10 @@ else:
         """, unsafe_allow_html=True)
 
     with col_right:
-        # Final device states after execution
         ac_eco   = final_state.get('ac_eco', False)
-        ac_on    = final_state.get('ac_on', False)
+        ac_on    = final_state.get('ac_on',  False)
         lamp_on  = final_state.get('lamp_on', False)
-        tv_on    = final_state.get('tv_on', False)
+        tv_on    = final_state.get('tv_on',  False)
 
         ac_final   = device_pill("AC Unit", ac_on,  is_eco=ac_eco)
         lamp_final = device_pill("Lamp",    lamp_on)
@@ -525,8 +744,33 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
+st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
-# ─── Footer ───────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ROW 03 -- Agent Reasoning / Decision Trace
+# =============================================================================
+st.markdown(
+    '<p class="section-label">03 &nbsp; Agent Reasoning &nbsp; / &nbsp; Decision Trace</p>',
+    unsafe_allow_html=True
+)
+
+reasoning_lines_html = ""
+for line in reasoning:
+    reasoning_lines_html += f'<div class="reasoning-line">{line}</div>'
+
+if not reasoning_lines_html:
+    reasoning_lines_html = '<div class="reasoning-line" style="color:#444;">No reasoning trace available.</div>'
+
+st.markdown(f"""
+<div class="panel-reasoning">
+    <p class="panel-title" style="color:#555; margin-bottom:1rem;">Internal Decision Log</p>
+    {reasoning_lines_html}
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
 st.markdown("""
 <div style="border-top: 1px solid #1e1e1e; padding-top: 1rem;">
