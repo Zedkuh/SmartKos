@@ -1,0 +1,8 @@
+scikit-fuzzy>=0.4.2
+numpy>=1.21.0
+streamlit>=1.28.0
+plotly>=5.15.0
+matplotlib>=3.5.0
+jupyter>=1.0.0
+ipykernel>=6.0.0
+networkx>=2.6.0
