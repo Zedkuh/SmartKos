@@ -81,6 +81,12 @@ Fixes applied over the initial version
 - Reasoning accumulated inline at each decision step (deliberative, not post-hoc).
 - DEVICE_REGISTRY added: single place to register a new device.
 - get_reasoning() removed: reasoning now built inside core_koswatt_agent.
+- Safety override moved before waste_category branching: at confidence=0,
+  effective_occupancy=0.5 sits on the exact vertex of both occ_empty and
+  occ_occupied MFs (membership=0 for both), so all fuzzy rules return 0 →
+  score=0 → LOW WASTE. The old override was nested inside 'else: HIGH WASTE'
+  and was therefore unreachable. Override now checks confidence first,
+  independent of waste classification.
 """
 
 import numpy as np
@@ -592,7 +598,39 @@ def core_koswatt_agent(
     action_sequence        = []
     medium_recommendations = []
 
-    if waste_category == 'LOW WASTE':
+    # Safety override is checked FIRST, before branching on waste_category.
+    # Rationale: at confidence=0, the formula
+    #   effective_occupancy = occupancy * 0 + 0.5 * 1 = 0.5
+    # places occupancy exactly on the boundary vertex of both occ_empty
+    # (trimf [0, 0, 0.5]) and occ_occupied (trimf [0.5, 1, 1]), where both
+    # membership functions return 0.  Every fuzzy rule has occ_empty or
+    # occ_occupied in its min-chain, so every clip collapses to zero,
+    # the aggregated surface is flat-zero, and compute_waste_score returns
+    # 0.0 → LOW WASTE.  The old override lived inside 'else: HIGH WASTE' and
+    # was therefore unreachable; the system would silently say "no action
+    # needed" for an uncertain room with all devices running.
+    if occupancy_confidence < 0.5 and occupancy < 0.5:
+        reasoning.append(
+            f"[PRIORITY 1: SAFETY OVERRIDE] Occupancy sensor confidence is "
+            f"{int(occupancy_confidence*100)}% — below the 50% threshold for "
+            f"autonomous action. Risk of acting on a false-empty reading (e.g. "
+            f"sleeping occupant). Autonomous action suspended regardless of waste "
+            f"score ({waste_category}). Priority 1 (Safety) overrides "
+            f"Priority 3 (Efficiency)."
+        )
+        # Surface the full STRIPS plan as non-binding recommendations so the
+        # operator sees what would have been done (including TV shutoff), not
+        # just the limited MEDIUM WASTE advisory set.
+        _safety_planner = StripsPlanner()
+        _safety_plan    = _safety_planner.plan(start_state, temperature, time_of_day)
+        medium_recommendations = [f"SUGGEST_{a}" for a in _safety_plan]
+        if medium_recommendations:
+            reasoning.append(
+                f"[ADVISORY] Non-binding recommendations (safety override): "
+                f"{medium_recommendations}. No plan executed."
+            )
+
+    elif waste_category == 'LOW WASTE':
         reasoning.append(
             "[DECISION] Waste within acceptable bounds. All active devices satisfy "
             "their governing ethical priority. No intervention required."
@@ -613,31 +651,8 @@ def core_koswatt_agent(
                 f"were lifted. No plan executed."
             )
 
-    else:  # HIGH WASTE
-        # Safety override: low occupancy confidence suspends autonomous action.
-        # A sleeping person detected as 'empty' at 40% confidence should not
-        # have the AC turned off -- Priority 1 (Safety) overrides Priority 3.
-        if occupancy_confidence < 0.5 and occupancy < 0.5:
-            reasoning.append(
-                f"[PRIORITY 1: SAFETY OVERRIDE] HIGH WASTE confirmed, but occupancy "
-                f"sensor confidence is {int(occupancy_confidence*100)}% — below the "
-                f"50% threshold for autonomous action. Risk of acting on a false-empty "
-                f"reading (e.g. sleeping occupant). Autonomous action suspended. "
-                f"Priority 1 (Safety) overrides Priority 3 (Efficiency)."
-            )
-            # Surface the full STRIPS plan as non-binding recommendations so the
-            # operator sees what would have been done (including TV shutoff), not
-            # just the limited MEDIUM WASTE advisory set.
-            _safety_planner = StripsPlanner()
-            _safety_plan    = _safety_planner.plan(start_state, temperature, time_of_day)
-            medium_recommendations = [f"SUGGEST_{a}" for a in _safety_plan]
-            if medium_recommendations:
-                reasoning.append(
-                    f"[ADVISORY] Non-binding recommendations (safety override): "
-                    f"{medium_recommendations}. No plan executed."
-                )
-
-        elif autonomy_level == 'advisory':
+    else:  # HIGH WASTE — safety override already cleared above
+        if autonomy_level == 'advisory':
             reasoning.append(
                 "[DECISION] HIGH WASTE confirmed. Autonomy is ADVISORY — STRIPS plan "
                 "computed for display, but no actions will be executed."
