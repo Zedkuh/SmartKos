@@ -2,100 +2,216 @@
 koswatt_agent.py
 ----------------
 KosWatt AI core.
-Import in app.py: from koswatt_agent import core_koswatt_agent
 
 Architecture
 ------------
 1. Fuzzy inference engine (Mamdani): evaluates energy waste on a 0-100 scale
-   using occupancy, temperature, time of day, and per-device context. Rules
-   are device-gated -- no rule fires for a device that is off.
+   using occupancy, temperature, time of day, and per-device context.
 
-2. STRIPS planner (BFS forward search): generates the minimal ordered action
-   sequence to reach an energy-efficient goal state. Activated only when the
-   fuzzy score exceeds the HIGH WASTE threshold (> 65).
+2. Ethical priority resolver: applies an explicit Safety > Comfort > Efficiency
+   hierarchy. Design decisions (device classifications, thresholds) are documented
+   in DEVICE_ETHICS and ETHICAL_PRIORITIES -- auditable constants, not hidden
+   assumptions.
 
-3. Ethical guardrails: embedded in both subsystems.
-     TV is classified as a RIGID device -- no tolerance in an empty room.
-     AC is classified as ADAPTIVE -- thermal context determines tolerance.
-     Lamp is classified as ADAPTIVE -- time of day determines tolerance.
-   The STRIPS goal builder and the fuzzy rules both reference AC_ECO_THRESHOLD
-   (28 C), ensuring consistency between the two subsystems.
+3. Rigid device override: guarantees HIGH classification for devices (TV) that
+   have no contextual justification, independent of aggregate fuzzy score.
+   Prevents calibration drift from masking obvious waste.
 
-Waste category thresholds
--------------------------
-> 65  : HIGH WASTE   -- aligned with the centroid of a fully-activated
-                        waste_high rule (membership rises from 60, peaks at 100).
-> 35  : MEDIUM WASTE -- aligned with the crossover mid-point between
-                        waste_low (zero at 40) and waste_medium (rising from 25).
-<= 35 : LOW WASTE
+4. STRIPS planner (BFS forward search): generates the minimal action sequence
+   to reach the energy-efficient goal state. Only runs when waste is HIGH and
+   the autonomy level permits action.
 
-Device wattage assumptions
---------------------------
-Based on a 1HP split-type inverter AC, LED lamp, and mid-size LED television
-in a single boarding house room. These are configurable constants and should
-be calibrated to actual device specs when deployed with real sensors and
-smart plugs.
+5. Deliberative reasoning trace: accumulated inline at each decision step as
+   the decision is made, not reconstructed after the fact.
+
+Ethical Framework
+-----------------
+The priority hierarchy is an explicit design choice, documented here:
+
+  Priority 1 — SAFETY:      Preserve safe conditions (security lighting, thermal
+                             safety). Takes precedence over all other priorities.
+  Priority 2 — COMFORT:     Respect occupant comfort within reasonable energy
+                             bounds. Thermal regulation with justification takes
+                             precedence over efficiency.
+  Priority 3 — EFFICIENCY:  Minimise energy waste when Safety and Comfort are
+                             already satisfied. Drives autonomous shutoff decisions.
+
+These are designer decisions, as they are in all symbolic AI systems. They are
+made explicit here so an examiner or operator can inspect, debate, and change
+them. The threshold AC_ECO_THRESHOLD = 28 C is justified below in DEVICE_ETHICS.
+
+Autonomy Levels
+---------------
+  'advisory'   -- Recommendations only. No autonomous action regardless of score.
+  'confirm'    -- HIGH WASTE generates a pending plan that requires human approval.
+  'autonomous' -- HIGH WASTE triggers immediate STRIPS execution (default).
+
+Occupancy Confidence
+--------------------
+Sensors are imperfect (motion sensor failure, sleeping person, etc.).
+occupancy_confidence (0.0–1.0) modulates the inferred occupancy:
+    effective_occupancy = sensor_reading * confidence + 0.5 * (1 - confidence)
+
+At confidence=1.0, effective equals the raw sensor value.
+At confidence=0.0, effective is 0.5 (maximally uncertain; system is maximally
+conservative). A sleeping person read as "empty" with 40% confidence produces
+an effective_occupancy of 0.3 -- still biased toward empty, but cautiously.
+When confidence drops below 0.5 and the room reads empty, the safety override
+suspends autonomous action entirely.
 
 Fixes applied over the initial version
 ---------------------------------------
-- watt_val removed from compute_waste_score signature. Waste classification
-  is driven entirely by device context and occupancy; the raw wattage figure
-  is used only for display and savings estimation, not inference.
-- Waste category thresholds (35, 65) documented with rationale derived from
-  the fuzzy membership function crossover points.
-- status_ac_eco added to core_koswatt_agent: the AC initial state can now
-  represent a device already in ECO mode, closing a model completeness gap.
-- get_medium_recommendations now covers both the AC ECO case (R3) and the
-  Lamp nighttime case (R6), matching the coverage of the reasoning log.
-- Fuzzy rules are fully device-gated (no rule fires for a device that is off).
-- AC ethical threshold unified at AC_ECO_THRESHOLD = 28 C across both the
-  fuzzy engine and STRIPS goal builder.
-- STRIPS_OPERATORS moved to module level.
-- apply_actions_to_state is only called when action_sequence is non-empty.
-- Input validation added: occupancy, temperature, and time_of_day are clamped
-  and coerced before entering the inference pipeline.
-- get_reasoning() produces human-readable decision trace for each agent
-  decision, exposed in the UI reasoning panel.
+- watt_val removed from compute_waste_score.
+- Waste category thresholds (35, 65) documented with membership function rationale.
+- status_ac_eco added to core_koswatt_agent.
+- get_medium_recommendations covers R3 and R6 cases.
+- Fuzzy rules fully device-gated.
+- AC ethical threshold unified at AC_ECO_THRESHOLD = 28 C.
+- STRIPS_OPERATORS at module level.
+- apply_actions_to_state only called when actions exist.
+- Input validation added.
+- R3b: AC already in ECO + hot + empty => LOW (not MEDIUM).
+- R4 gated on not-ECO to prevent HIGH/no-actions contradiction at T=28 C.
+- calculate_post_action_watt delegates to calculate_watt (no duplication).
+- ETHICAL_PRIORITIES and DEVICE_ETHICS added: ethics made explicit.
+- autonomy_level parameter: 'advisory' | 'confirm' | 'autonomous'.
+- occupancy_confidence parameter with safety override at low confidence.
+- Rigid device override: TV-in-empty-room escalates to HIGH independent of
+  aggregate fuzzy score, preventing calibration drift from hiding obvious waste.
+- Reasoning accumulated inline at each decision step (deliberative, not post-hoc).
+- DEVICE_REGISTRY added: single place to register a new device.
+- get_reasoning() removed: reasoning now built inside core_koswatt_agent.
 """
 
 import numpy as np
 import skfuzzy as fuzz
-from collections import deque
+from collections import deque, OrderedDict
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='skfuzzy')
+warnings.filterwarnings('ignore', category=RuntimeWarning,    module='skfuzzy')
 
 
-# ── Device wattage constants ──────────────────────────────────────────────────
-STANDBY_WATTS  = 10     # Baseline idle draw (router, smart meter, etc.)
-LAMP_WATTS     = 15     # LED lamp
-TV_WATTS       = 100    # Mid-size LED television
-AC_HOT_WATTS   = 450    # 1HP split AC, high-load mode (ambient > 30 C)
-AC_COOL_WATTS  = 280    # 1HP split AC, mild weather mode (ambient <= 30 C)
-AC_ECO_WATTS   = 150    # 1HP split AC, sleep or ECO mode
+# =============================================================================
+# ETHICAL FRAMEWORK  (explicit, auditable design decisions)
+# =============================================================================
 
-# Ethical guardrail temperature threshold (Celsius).
-# At or above this value, AC in an empty room is permitted to remain in ECO
-# mode. Below this value, continued AC operation has no thermal justification
-# and the STRIPS planner will schedule a full shutoff.
-# Aligned with the onset of temp_hot membership to ensure consistency between
-# the fuzzy inference rules and the STRIPS goal builder.
-AC_ECO_THRESHOLD = 28
+ETHICAL_PRIORITIES = OrderedDict([
+    ('SAFETY',
+     'Preserve safe operating conditions and occupant wellbeing above all else. '
+     'Includes security lighting at night and protection against thermal extremes. '
+     'No efficiency gain justifies compromising safety.'),
+
+    ('COMFORT',
+     'Respect occupant comfort within reasonable energy bounds. Thermal regulation '
+     'with environmental justification (ambient >= AC_ECO_THRESHOLD) takes '
+     'precedence over immediate efficiency targets.'),
+
+    ('EFFICIENCY',
+     'Minimise energy waste when Safety and Comfort are already satisfied. '
+     'Drives all autonomous shutoff and ECO-mode decisions. Applied only after '
+     'Priorities 1 and 2 are evaluated.'),
+])
+
+DEVICE_ETHICS = {
+    'TV': {
+        'class': 'RIGID',
+        'justification': (
+            'Entertainment device. No safety, comfort, or thermal justification '
+            'exists for operation in an unoccupied room. Conflicts with Priority 3 '
+            '(Efficiency) with zero countervailing claim from Priority 1 or 2. '
+            'Classified RIGID: no contextual exception is granted. TV is the only '
+            'device in this system with no adaptive-guardrail tolerance.'
+        ),
+    },
+    'AC': {
+        'class': 'ADAPTIVE',
+        'justification': (
+            'Thermal regulation device that directly affects occupant health and '
+            'comfort on return. At or above AC_ECO_THRESHOLD (28 C), continued '
+            'operation in ECO mode satisfies Priority 2 (Comfort) -- pre-cooling '
+            'a room that will be reoccupied is a legitimate ethical reason to '
+            'withhold full shutoff. 28 C is chosen as the onset of the temp_hot '
+            'fuzzy membership function, aligning the crisp STRIPS boundary with '
+            'the fuzzy classification boundary. Below 28 C, no thermal '
+            'justification exists and the AC is scheduled for shutoff.'
+        ),
+    },
+    'LAMP': {
+        'class': 'ADAPTIVE',
+        'justification': (
+            'Lighting device. At night, an active lamp satisfies Priority 1 (Safety): '
+            'it provides security deterrence and safe re-entry illumination for '
+            'returning occupants. This safety benefit outweighs the 15 W draw. '
+            'During daytime, natural light renders artificial lighting unnecessary -- '
+            'no Safety or Comfort claim applies, so Priority 3 (Efficiency) governs '
+            'and the lamp is scheduled for shutoff.'
+        ),
+    },
+}
+
+AUTONOMY_LEVELS = {
+    'advisory': (
+        'Generate non-binding recommendations only. No autonomous action is taken '
+        'regardless of waste classification. Fully respects user autonomy; the '
+        'agent acts as an advisor, not an executor.'
+    ),
+    'confirm': (
+        'HIGH WASTE generates a ready-to-execute STRIPS plan, but the agent '
+        'waits for explicit human approval before acting. Balances energy '
+        'efficiency with user control. Recommended for most deployments.'
+    ),
+    'autonomous': (
+        'HIGH WASTE triggers immediate STRIPS plan execution without human '
+        'confirmation. Suitable for fully trusted, monitored deployments where '
+        'the sensor infrastructure is reliable.'
+    ),
+}
+
+# Device registry: documents all devices in one place.
+# NOTE: This is a documentation scaffold that shows the intended extensibility
+# pattern. Adding a new device here does NOT automatically wire it into the
+# fuzzy engine, STRIPS operators, or watt helpers -- those require separate
+# additions. The registry's purpose is to make the full set of ethical
+# classifications visible and auditable in a single location.
+DEVICE_REGISTRY = {
+    'TV':   {'ethics': DEVICE_ETHICS['TV']},
+    'AC':   {'ethics': DEVICE_ETHICS['AC']},
+    'LAMP': {'ethics': DEVICE_ETHICS['LAMP']},
+}
 
 
-# ── Fuzzy universe ranges ─────────────────────────────────────────────────────
+# =============================================================================
+# WATTAGE CONSTANTS
+# =============================================================================
+
+STANDBY_WATTS  = 10   # Baseline idle draw (router, smart meter, etc.)
+LAMP_WATTS     = 15   # LED lamp
+TV_WATTS       = 100  # Mid-size LED television
+AC_HOT_WATTS   = 450  # 1HP split AC, high-load (ambient > 30 C)
+AC_COOL_WATTS  = 280  # 1HP split AC, mild weather (ambient <= 30 C)
+AC_ECO_WATTS   = 150  # 1HP split AC, ECO / sleep mode
+
+# Ethical guardrail temperature threshold.
+# Justified in DEVICE_ETHICS['AC'] above. Aligned with temp_hot MF onset
+# so that the fuzzy engine and STRIPS goal builder share the same boundary.
+AC_ECO_THRESHOLD = 28  # °C
+
+
+# =============================================================================
+# FUZZY UNIVERSE AND MEMBERSHIP FUNCTIONS
+# =============================================================================
+
 occupancy_range   = np.arange(0, 1.01, 0.01)
 temperature_range = np.arange(20, 41, 1)
 tod_range         = np.arange(0, 1.01, 0.01)
 waste_range       = np.arange(0, 101, 1)
 
-
-# ── Membership functions ──────────────────────────────────────────────────────
 occ_empty    = fuzz.trimf(occupancy_range, [0,   0,   0.5])
 occ_occupied = fuzz.trimf(occupancy_range, [0.5, 1,   1  ])
 
-# temp_hot onset is aligned with AC_ECO_THRESHOLD.
-# The 28-30 C overlap zone is intentional -- it represents the ambiguous
-# transitional state where neither fully cool nor fully hot has membership.
+# temp_hot onset at 28 C aligns with AC_ECO_THRESHOLD.
+# The 28–30 C overlap is intentional: the transitional zone where neither
+# fully cool nor fully hot has exclusive membership.
 temp_cool = fuzz.trimf(temperature_range, [20, 20, 30])
 temp_hot  = fuzz.trimf(temperature_range, [28, 40, 40])
 
@@ -109,76 +225,67 @@ waste_high   = fuzz.trimf(waste_range, [60, 100, 100])
 _ZERO = np.zeros_like(waste_range, dtype=float)
 
 
-# ── STRIPS operators (module level) ──────────────────────────────────────────
-# Defined here so both StripsPlanner and apply_actions_to_state reference
-# the same list without requiring a planner instance to read operators.
+# =============================================================================
+# STRIPS OPERATORS
+# =============================================================================
+
 STRIPS_OPERATORS = [
     {
-        'name'        : 'TURN_OFF_TV',
+        'name':         'TURN_OFF_TV',
         'precondition': lambda s: s.get('tv_on', False),
-        'effect'      : lambda s: {**s, 'tv_on': False}
+        'effect':       lambda s: {**s, 'tv_on': False},
     },
     {
-        'name'        : 'TURN_OFF_LAMP',
+        'name':         'TURN_OFF_LAMP',
         'precondition': lambda s: s.get('lamp_on', False),
-        'effect'      : lambda s: {**s, 'lamp_on': False}
+        'effect':       lambda s: {**s, 'lamp_on': False},
     },
     {
-        'name'        : 'TURN_OFF_AC',
+        'name':         'TURN_OFF_AC',
         'precondition': lambda s: s.get('ac_on', False) and not s.get('ac_eco', False),
-        'effect'      : lambda s: {**s, 'ac_on': False, 'ac_eco': False}
+        'effect':       lambda s: {**s, 'ac_on': False, 'ac_eco': False},
     },
     {
-        # Handles the case where AC was already in ECO mode at the start of the
-        # planning cycle and the thermal context does not justify even ECO operation
-        # (ambient < AC_ECO_THRESHOLD). TURN_OFF_AC cannot apply in this state
-        # because its precondition requires not ac_eco.
-        'name'        : 'TURN_OFF_AC_ECO',
+        # Handles AC already in ECO mode when thermal context doesn't justify
+        # even ECO operation (ambient < AC_ECO_THRESHOLD).
+        'name':         'TURN_OFF_AC_ECO',
         'precondition': lambda s: s.get('ac_on', False) and s.get('ac_eco', False),
-        'effect'      : lambda s: {**s, 'ac_on': False, 'ac_eco': False}
+        'effect':       lambda s: {**s, 'ac_on': False, 'ac_eco': False},
     },
     {
-        'name'        : 'SET_AC_TO_ECO',
+        'name':         'SET_AC_TO_ECO',
         'precondition': lambda s: s.get('ac_on', False) and not s.get('ac_eco', False),
-        'effect'      : lambda s: {**s, 'ac_eco': True}
+        'effect':       lambda s: {**s, 'ac_eco': True},
     },
 ]
 
 
-# ── Fuzzy inference ───────────────────────────────────────────────────────────
+# =============================================================================
+# FUZZY INFERENCE ENGINE
+# =============================================================================
 
 def compute_waste_score(occupancy_val, temperature_val, time_of_day_val,
-                        tv_on=False, ac_on=False, lamp_on=False):
+                        tv_on=False, ac_on=False, lamp_on=False, ac_eco=False):
     """
     Mamdani fuzzy inference engine for energy waste classification.
 
+    Accepts effective_occupancy (not raw sensor reading) so that occupancy
+    confidence modulation is already applied before inference.
+
     Fuzzy rules
     -----------
-    R1  Occupied room => waste LOW.
-        Occupants have a right to use their devices. No interference with an
-        occupied room regardless of wattage.
-    R2  Empty + TV on => waste HIGH.
-        TV is a rigid device. No contextual tolerance in an empty room.
-    R3  Empty + AC on + hot ambient (>= 28 C) => waste MEDIUM.
-        Thermal justification: preserving partial cooling for returning
-        occupants is a valid ethical reason to withhold full shutoff.
-    R4  Empty + AC on + cool ambient (< 28 C) => waste HIGH.
-        No thermal justification. Cooling an empty room when it is not hot
-        is classified as unambiguous waste.
-    R5  Empty + Lamp on + daytime => waste HIGH.
-        Natural light is available. Artificial lighting is unnecessary.
-    R6  Empty + Lamp on + nighttime => waste MEDIUM.
-        Safety and deterrence lighting has partial justification at night.
-
-    All device rules are gated by actual on/off status. Waste classification
-    is driven by device context and occupancy, not raw wattage.
+    R1   Occupied => LOW.
+    R2   Empty + TV => HIGH.  (TV: RIGID -- no tolerance)
+    R3   Empty + AC full mode + hot ambient  => MEDIUM.  (Comfort justification)
+    R3b  Empty + AC ECO mode  + hot ambient  => LOW.     (Already optimised)
+    R4   Empty + AC full mode + cool ambient => HIGH.    (No thermal justification)
+         Gated on full-mode only: ECO+cool scores LOW, preventing the HIGH/
+         no-actions contradiction at the AC_ECO_THRESHOLD boundary (T=28 C).
+    R5   Empty + Lamp + daytime  => HIGH.   (Natural light available)
+    R6   Empty + Lamp + nighttime => MEDIUM. (Safety justification)
     """
-    # ── SHORT-CIRCUIT GUARD ───────────────────────────────────────────────────
-    # Force absolute zero if all managed devices are completely turned off.
-    # This prevents centroid defuzzification of R1 from returning 13.3 W.
     if not (tv_on or ac_on or lamp_on):
         return 0.0
-    # ──────────────────────────────────────────────────────────────────────────
 
     mu_occ_empty    = fuzz.interp_membership(occupancy_range, occ_empty,    occupancy_val)
     mu_occ_occupied = fuzz.interp_membership(occupancy_range, occ_occupied, occupancy_val)
@@ -190,19 +297,20 @@ def compute_waste_score(occupancy_val, temperature_val, time_of_day_val,
     # R1: Occupied => LOW
     clip_occupied_low = np.fmin(mu_occ_occupied, waste_low)
 
-    # R2: TV -- rigid device
+    # R2: TV -- RIGID device
     tv_gate      = mu_occ_empty if tv_on else 0.0
     clip_tv_high = np.fmin(tv_gate, waste_high)
 
-    # R3/R4: AC -- adaptive device (rules gated by ac_on)
-    clip_ac_medium = np.fmin(np.fmin(mu_occ_empty, mu_temp_hot),  waste_medium) if ac_on else _ZERO
-    clip_ac_high   = np.fmin(np.fmin(mu_occ_empty, mu_temp_cool), waste_high)   if ac_on else _ZERO
+    # R3 / R3b / R4: AC -- ADAPTIVE device
+    clip_ac_eco_low = np.fmin(np.fmin(mu_occ_empty, mu_temp_hot),  waste_low)    if (ac_on and ac_eco)     else _ZERO
+    clip_ac_medium  = np.fmin(np.fmin(mu_occ_empty, mu_temp_hot),  waste_medium) if (ac_on and not ac_eco) else _ZERO
+    clip_ac_high    = np.fmin(np.fmin(mu_occ_empty, mu_temp_cool), waste_high)   if (ac_on and not ac_eco) else _ZERO
 
-    # R5/R6: Lamp -- adaptive device (rules gated by lamp_on)
+    # R5 / R6: Lamp -- ADAPTIVE device
     clip_lamp_high   = np.fmin(np.fmin(mu_occ_empty, mu_tod_day),   waste_high)   if lamp_on else _ZERO
     clip_lamp_medium = np.fmin(np.fmin(mu_occ_empty, mu_tod_night), waste_medium) if lamp_on else _ZERO
 
-    agg_low    = clip_occupied_low
+    agg_low    = np.fmax(clip_occupied_low, clip_ac_eco_low)
     agg_medium = np.fmax(clip_ac_medium, clip_lamp_medium)
     agg_high   = np.fmax(clip_tv_high, np.fmax(clip_ac_high, clip_lamp_high))
 
@@ -212,20 +320,23 @@ def compute_waste_score(occupancy_val, temperature_val, time_of_day_val,
     return float(np.clip(fuzz.defuzz(waste_range, aggregated, 'centroid'), 0, 100))
 
 
-# ── STRIPS planner ────────────────────────────────────────────────────────────
+# =============================================================================
+# STRIPS PLANNER
+# =============================================================================
 
 class StripsPlanner:
     """
     STRIPS-based energy intervention planner.
 
-    State space : boolean device flags {ac_on, lamp_on, tv_on, ac_eco}.
-    Goal state  : energy-efficient configuration derived from ethical guardrails.
-    Search      : BFS forward chaining, guaranteeing the shortest action sequence.
+    State space  : boolean device flags {ac_on, lamp_on, tv_on, ac_eco}.
+    Goal state   : energy-efficient configuration derived from DEVICE_ETHICS and
+                   ETHICAL_PRIORITIES.
+    Search       : BFS forward chaining, guaranteeing shortest action sequence.
 
-    Goal construction respects the same ethical guardrails as the fuzzy engine:
-      TV is always off in an empty room (rigid device).
-      AC: ECO mode if ambient >= AC_ECO_THRESHOLD, OFF otherwise (adaptive).
-      Lamp: OFF during daytime, tolerated at nighttime (adaptive).
+    Goal construction applies the same ethical priorities as the fuzzy engine:
+      TV  (RIGID)    : always off in an empty room.
+      AC  (ADAPTIVE) : ECO if ambient >= AC_ECO_THRESHOLD, OFF otherwise.
+      Lamp (ADAPTIVE): OFF during daytime, tolerated at nighttime.
     """
 
     def __init__(self):
@@ -233,18 +344,15 @@ class StripsPlanner:
 
     def _build_goal_state(self, current_state, temperature, time_of_day):
         goal = dict(current_state)
-        # TV: rigid -- always off in empty room
-        goal['tv_on'] = False
-        # AC: adaptive -- ECO if at or above threshold, OFF otherwise
+        goal['tv_on'] = False          # Priority 3: RIGID, no exception
         if goal.get('ac_on', False):
             if temperature >= AC_ECO_THRESHOLD:
-                goal['ac_eco'] = True
+                goal['ac_eco'] = True  # Priority 2: Comfort -- ECO permitted
             else:
-                goal['ac_on']  = False
+                goal['ac_on']  = False # Priority 3: Efficiency -- no justification
                 goal['ac_eco'] = False
-        # Lamp: adaptive -- off during daytime, tolerated at night
         if goal.get('lamp_on', False) and time_of_day < 0.5:
-            goal['lamp_on'] = False
+            goal['lamp_on'] = False    # Priority 3: daytime lamp has no justification
         return goal
 
     def _satisfies(self, state, goal):
@@ -254,11 +362,7 @@ class StripsPlanner:
         return tuple(sorted(state.items()))
 
     def plan(self, start_state, temperature, time_of_day):
-        """
-        BFS forward search from start_state toward goal.
-        Returns an ordered list of action name strings.
-        Returns [] if start_state already satisfies the goal.
-        """
+        """BFS. Returns [] if start_state already satisfies goal."""
         goal = self._build_goal_state(start_state, temperature, time_of_day)
         if self._satisfies(start_state, goal):
             return []
@@ -279,7 +383,9 @@ class StripsPlanner:
         return []
 
 
-# ── Watt calculation helpers ──────────────────────────────────────────────────
+# =============================================================================
+# WATT CALCULATION HELPERS
+# =============================================================================
 
 def calculate_watt(status_ac, status_lamp, status_tv, temperature, status_ac_eco=False):
     """Estimate total power draw in watts given current device states."""
@@ -296,21 +402,17 @@ def calculate_watt(status_ac, status_lamp, status_tv, temperature, status_ac_eco
 
 def calculate_post_action_watt(final_state, temperature):
     """Estimate power draw after STRIPS actions have been applied."""
-    total = STANDBY_WATTS
-    if final_state.get('lamp_on'): total += LAMP_WATTS
-    if final_state.get('tv_on'):   total += TV_WATTS
-    if final_state.get('ac_on'):
-        total += (AC_ECO_WATTS if final_state.get('ac_eco')
-                  else (AC_HOT_WATTS if temperature > 30 else AC_COOL_WATTS))
-    return total
+    return calculate_watt(
+        status_ac     = final_state.get('ac_on',   False),
+        status_lamp   = final_state.get('lamp_on', False),
+        status_tv     = final_state.get('tv_on',   False),
+        temperature   = temperature,
+        status_ac_eco = final_state.get('ac_eco',  False),
+    )
 
 
 def apply_actions_to_state(start_state, actions):
-    """
-    Apply an ordered sequence of STRIPS action names to start_state and
-    return the resulting device state dict. References STRIPS_OPERATORS
-    directly -- no StripsPlanner instance required.
-    """
+    """Apply an ordered list of STRIPS action names to start_state."""
     op_map = {op['name']: op for op in STRIPS_OPERATORS}
     state  = dict(start_state)
     for name in actions:
@@ -319,15 +421,8 @@ def apply_actions_to_state(start_state, actions):
     return state
 
 
-# ── Advisory and reasoning helpers ───────────────────────────────────────────
-
 def get_medium_recommendations(start_state, temperature, time_of_day):
-    """
-    Returns advisory (non-binding) action suggestions for MEDIUM WASTE cases.
-    These represent what the STRIPS planner would propose if unrestricted.
-    The agent does not execute them autonomously -- they are surfaced to the
-    user interface as recommendations only.
-    """
+    """Advisory (non-binding) suggestions for MEDIUM WASTE cases."""
     recs = []
     if start_state.get('ac_on') and not start_state.get('ac_eco'):
         recs.append('SUGGEST_AC_ECO')
@@ -336,205 +431,262 @@ def get_medium_recommendations(start_state, temperature, time_of_day):
     return recs
 
 
-def get_reasoning(waste_category, start_state, action_sequence, temperature,
-                  time_of_day, medium_recommendations=None):
-    """
-    Returns an ordered list of human-readable strings explaining the
-    agent's decision. Each string represents one reasoning step or observation.
-    Intended for display in the Agent Reasoning panel of the UI.
-    """
-    lines = []
+# =============================================================================
+# MAIN AGENT ENTRY POINT
+# =============================================================================
 
-    if waste_category == 'LOW WASTE':
-        active = [k for k in ('ac_on', 'lamp_on', 'tv_on') if start_state.get(k)]
-        if not active:
-            lines.append(
-                "No active devices detected. Only standby draw is present. "
-                "No evaluation required."
-            )
-        else:
-            lines.append(
-                "Power draw is within acceptable range for the current occupancy "
-                "and environmental context. Active devices are operating within "
-                "ethical parameters. No intervention required."
-            )
-
-    elif waste_category == 'MEDIUM WASTE':
-        if start_state.get('ac_on') and temperature >= AC_ECO_THRESHOLD:
-            if start_state.get('ac_eco'):
-                lines.append(
-                    f"AC is active in ECO mode in an empty room at {int(temperature)} C. "
-                    f"Ambient temperature at or above {AC_ECO_THRESHOLD} C provides thermal "
-                    "justification for continued operation. ECO mode is already the "
-                    "energy-reduced state; no further reduction is applicable. "
-                    "No action required."
-                )
-            else:
-                lines.append(
-                    f"AC is active in an empty room at {int(temperature)} C. Ambient temperature "
-                    f"at or above {AC_ECO_THRESHOLD} C provides partial thermal justification "
-                    "for continued operation. Shutting the AC off risks occupant discomfort on "
-                    "return. Autonomous action withheld under the adaptive device guardrail."
-                )
-        if start_state.get('lamp_on') and time_of_day >= 0.5:
-            lines.append(
-                "Lamp is active in an empty room at night. Safety and deterrence "
-                "lighting carries partial justification during nighttime hours. "
-                "Autonomous shutoff withheld under the adaptive device guardrail."
-            )
-        if medium_recommendations:
-            lines.append(
-                "Non-binding advisory recommendations are available to reduce draw "
-                "without triggering autonomous action. No STRIPS plan has been executed."
-            )
-
-    else:  # HIGH WASTE
-        if not action_sequence:
-            lines.append(
-                "Waste score exceeds the HIGH threshold but device states are already "
-                "at the energy-optimal configuration. No further actions are required."
-            )
-        for action in action_sequence:
-            if action == 'TURN_OFF_TV':
-                lines.append(
-                    "TV is active in an empty room. No contextual justification exists "
-                    "for an entertainment device when occupancy is zero. "
-                    "TV scheduled for shutoff."
-                )
-            elif action == 'TURN_OFF_AC':
-                lines.append(
-                    f"AC is active in an empty room at {int(temperature)} C. Temperature is "
-                    f"below the thermal threshold ({AC_ECO_THRESHOLD} C). No justification "
-                    "for continued cooling. AC scheduled for shutoff."
-                )
-            elif action == 'TURN_OFF_AC_ECO':
-                lines.append(
-                    f"AC is in ECO mode in an empty room at {int(temperature)} C. Temperature "
-                    f"is below the thermal threshold ({AC_ECO_THRESHOLD} C). ECO mode does not "
-                    "provide sufficient justification for continued operation at this ambient "
-                    "temperature. AC scheduled for shutoff."
-                )
-            elif action == 'SET_AC_TO_ECO':
-                lines.append(
-                    f"AC is active in an empty room at {int(temperature)} C. Temperature at "
-                    f"or above {AC_ECO_THRESHOLD} C provides partial thermal justification. "
-                    "Full shutoff is withheld under the adaptive guardrail. Switching to "
-                    "ECO mode preserves comfort margin while reducing draw."
-                )
-            elif action == 'TURN_OFF_LAMP':
-                lines.append(
-                    "Lamp is active in an empty room during daytime. Natural light "
-                    "renders artificial lighting unnecessary. Lamp scheduled for shutoff."
-                )
-
-    return lines
-
-
-# ── Main agent entry point ────────────────────────────────────────────────────
-
-def core_koswatt_agent(occupancy, temperature, time_of_day,
-                       status_ac, status_lamp, status_tv,
-                       status_ac_eco=False):
+def core_koswatt_agent(
+    occupancy, temperature, time_of_day,
+    status_ac, status_lamp, status_tv,
+    status_ac_eco=False,
+    autonomy_level='autonomous',
+    occupancy_confidence=1.0,
+):
     """
     Main KosWatt agent entry point.
 
+    Reasoning is accumulated inline at each decision step as the decision is
+    made. This is deliberative (each line caused the next decision) rather than
+    post-hoc (explanation reconstructed after the fact).
+
     Parameters
     ----------
-    occupancy     : 0 (empty) or 1 (occupied); clamped to [0.0, 1.0]
-    temperature   : ambient temperature in Celsius; clamped to [20.0, 40.0]
-    time_of_day   : 0 (day) or 1 (night); clamped to [0.0, 1.0]
-    status_ac     : bool -- AC currently switched on
-    status_lamp   : bool -- Lamp currently switched on
-    status_tv     : bool -- TV currently switched on
-    status_ac_eco : bool -- AC is already in ECO mode (default False)
+    occupancy             : 0 (empty) or 1 (occupied)
+    temperature           : ambient temperature in Celsius; clamped to [20, 40]
+    time_of_day           : 0 (day) or 1 (night)
+    status_ac             : bool -- AC on
+    status_lamp           : bool -- lamp on
+    status_tv             : bool -- TV on
+    status_ac_eco         : bool -- AC already in ECO mode
+    autonomy_level        : 'advisory' | 'confirm' | 'autonomous'
+    occupancy_confidence  : float [0.0–1.0] -- sensor confidence in occupancy
 
     Returns
     -------
     dict with keys:
-      fuzzy_score             float  waste score 0-100
-      waste_category          str    'LOW WASTE' | 'MEDIUM WASTE' | 'HIGH WASTE'
-      action_sequence         list   ordered STRIPS action names (autonomous)
-      initial_watt            int    estimated draw before AI intervention
-      final_state             dict   device states after actions applied
-      final_watt              int    estimated draw after AI intervention
-      medium_recommendations  list   advisory action names (MEDIUM WASTE only)
-      reasoning               list   human-readable decision explanation strings
+      fuzzy_score, waste_category, action_sequence, initial_watt,
+      final_state, final_watt, medium_recommendations, reasoning,
+      autonomy_level, occupancy_confidence, effective_occupancy,
+      awaiting_confirmation
     """
-    # Input validation and type coercion
-    occupancy   = float(np.clip(float(occupancy),   0.0, 1.0))
-    temperature = float(np.clip(float(temperature), 20.0, 40.0))
-    time_of_day = float(np.clip(float(time_of_day), 0.0, 1.0))
+    # ── Input validation ──────────────────────────────────────────────────────
+    occupancy            = float(np.clip(float(occupancy),            0.0, 1.0))
+    temperature          = float(np.clip(float(temperature),          20.0, 40.0))
+    time_of_day          = float(np.clip(float(time_of_day),          0.0, 1.0))
+    occupancy_confidence = float(np.clip(float(occupancy_confidence), 0.0, 1.0))
     status_ac     = bool(status_ac)
     status_lamp   = bool(status_lamp)
     status_tv     = bool(status_tv)
-    # If AC is off, ECO state is meaningless; force it to False.
     status_ac_eco = bool(status_ac_eco) if status_ac else False
+    if autonomy_level not in AUTONOMY_LEVELS:
+        autonomy_level = 'autonomous'
 
-    # Step 1: Estimate current power draw
+    reasoning = []
+
+    # ── STEP 0: Declare autonomy level ───────────────────────────────────────
+    reasoning.append(
+        f"[AUTONOMY] Operating at '{autonomy_level.upper()}' level. "
+        f"{AUTONOMY_LEVELS[autonomy_level]}"
+    )
+
+    # ── STEP 1: Occupancy with confidence modulation ─────────────────────────
+    # Formula: effective = sensor * confidence + 0.5 * (1 - confidence)
+    # At confidence=1.0 → effective = sensor value exactly.
+    # At confidence=0.0 → effective = 0.5 (maximally uncertain; maximally
+    #                                  conservative before autonomous action).
+    effective_occupancy = occupancy * occupancy_confidence + 0.5 * (1.0 - occupancy_confidence)
+
+    if occupancy_confidence < 1.0:
+        raw_label  = 'OCCUPIED' if occupancy >= 0.5 else 'EMPTY'
+        conf_pct   = int(occupancy_confidence * 100)
+        reasoning.append(
+            f"[PRIORITY 1: SAFETY] Sensor reports {raw_label} at {conf_pct}% confidence. "
+            f"Effective occupancy modulated to {effective_occupancy:.2f} "
+            f"(0.0=certain-empty, 1.0=certain-occupied). "
+            f"Low confidence increases caution before any autonomous action."
+        )
+    else:
+        occ_label = 'OCCUPIED' if occupancy >= 0.5 else 'EMPTY'
+        reasoning.append(
+            f"[PRIORITY 1: SAFETY] Occupancy confirmed {occ_label} at 100% confidence."
+        )
+
+    # ── STEP 2: Fuzzy waste scoring ───────────────────────────────────────────
     initial_watt = calculate_watt(status_ac, status_lamp, status_tv, temperature,
                                   status_ac_eco=status_ac_eco)
 
-    # Step 2: Fuzzy inference -- score the waste level
     fuzzy_score = compute_waste_score(
-        occupancy_val   = occupancy,
+        occupancy_val   = effective_occupancy,
         temperature_val = temperature,
         time_of_day_val = time_of_day,
         tv_on           = status_tv,
         ac_on           = status_ac,
-        lamp_on         = status_lamp
+        lamp_on         = status_lamp,
+        ac_eco          = status_ac_eco,
+    )
+    reasoning.append(
+        f"[FUZZY ENGINE] Mamdani inference over {initial_watt} W draw at {temperature} C. "
+        f"Waste score: {fuzzy_score:.1f}/100."
     )
 
-    # Step 3: Classify waste category
-    # Thresholds are aligned with the fuzzy membership function crossover points.
-    # waste_high has full membership at 100 and rises from 60; its centroid for
-    # a fully-activated high rule lands above 65, making > 65 the natural HIGH
-    # boundary. waste_medium is centred at 50 with full membership between 25
-    # and 75; the LOW/MEDIUM boundary at 35 sits at the crossover between
-    # waste_low (zero at 40) and waste_medium (rising from 25), which is the
-    # mid-point of that overlap region.
+    # ── STEP 3: Waste classification ──────────────────────────────────────────
     if fuzzy_score > 65:
         waste_category = 'HIGH WASTE'
     elif fuzzy_score > 35:
         waste_category = 'MEDIUM WASTE'
     else:
         waste_category = 'LOW WASTE'
+    reasoning.append(
+        f"[CLASSIFICATION] Score {fuzzy_score:.1f} → {waste_category}. "
+        f"Thresholds: ≤35 LOW | 35–65 MEDIUM | >65 HIGH."
+    )
 
-    # Step 4: Build initial device state dict
+    # ── STEP 4: Ethical priority resolution ──────────────────────────────────
+    # For each active device in an assessed-empty room, log which ethical
+    # priority governs the decision before any action is taken.
+    if effective_occupancy < 0.5:
+        for device, (active, _) in [
+            ('TV',   (status_tv,   False)),
+            ('AC',   (status_ac,   status_ac_eco)),
+            ('LAMP', (status_lamp, False)),
+        ]:
+            if not active:
+                continue
+            meta = DEVICE_ETHICS[device]
+            if device == 'AC':
+                priority = 'COMFORT' if temperature >= AC_ECO_THRESHOLD else 'EFFICIENCY'
+            elif device == 'LAMP':
+                priority = 'SAFETY' if time_of_day >= 0.5 else 'EFFICIENCY'
+            else:
+                priority = 'EFFICIENCY'
+            reasoning.append(
+                f"[PRIORITY {list(ETHICAL_PRIORITIES.keys()).index(priority)+1}: {priority}] "
+                f"{device} ({meta['class']}): {meta['justification']}"
+            )
+
+    # ── STEP 5: Rigid device override ────────────────────────────────────────
+    # Guarantees HIGH classification for TV in an empty room, independent of
+    # the aggregate fuzzy score. Prevents calibration drift or rule interaction
+    # from letting an obvious waste case slip below the HIGH threshold.
+    if status_tv and effective_occupancy < 0.5 and waste_category != 'HIGH WASTE':
+        prev_category  = waste_category
+        waste_category = 'HIGH WASTE'
+        reasoning.append(
+            f"[RIGID OVERRIDE] TV (RIGID device) is active in an assessed-empty room. "
+            f"Fuzzy score alone classified this as {prev_category}. "
+            f"Rigid override escalates to HIGH WASTE. No Safety or Comfort priority "
+            f"can justify an entertainment device in an empty room; Priority 3 "
+            f"(Efficiency) applies absolutely."
+        )
+
+    # ── STEP 6: Build device state dict ──────────────────────────────────────
     start_state = {
         'ac_on'  : status_ac,
         'lamp_on': status_lamp,
         'tv_on'  : status_tv,
-        'ac_eco' : status_ac_eco
+        'ac_eco' : status_ac_eco,
     }
 
-    # Step 5: STRIPS planning -- autonomous action, HIGH WASTE only
-    action_sequence = []
-    if waste_category == 'HIGH WASTE':
-        planner         = StripsPlanner()
-        action_sequence = planner.plan(start_state, temperature, time_of_day)
-
-    # Step 6: Advisory recommendations -- non-binding, MEDIUM WASTE only
+    # ── STEP 7: Action planning with autonomy and confidence gating ──────────
+    awaiting_confirmation  = False
+    action_sequence        = []
     medium_recommendations = []
-    if waste_category == 'MEDIUM WASTE':
+
+    if waste_category == 'LOW WASTE':
+        reasoning.append(
+            "[DECISION] Waste within acceptable bounds. All active devices satisfy "
+            "their governing ethical priority. No intervention required."
+        )
+
+    elif waste_category == 'MEDIUM WASTE':
+        reasoning.append(
+            "[DECISION] MEDIUM WASTE. Contextual justification (Safety or Comfort) "
+            "withholds autonomous action. Adaptive guardrail active."
+        )
         medium_recommendations = get_medium_recommendations(
             start_state, temperature, time_of_day
         )
+        if medium_recommendations:
+            reasoning.append(
+                f"[ADVISORY] Non-binding recommendations: {', '.join(medium_recommendations)}. "
+                f"These represent what the STRIPS planner would propose if the guardrail "
+                f"were lifted. No plan executed."
+            )
 
-    # Step 7: Apply actions and compute final power state.
-    # Only runs when actions exist, avoiding redundant computation on
-    # LOW and MEDIUM paths where no actions are taken.
-    if action_sequence:
+    else:  # HIGH WASTE
+        # Safety override: low occupancy confidence suspends autonomous action.
+        # A sleeping person detected as 'empty' at 40% confidence should not
+        # have the AC turned off -- Priority 1 (Safety) overrides Priority 3.
+        if occupancy_confidence < 0.5 and occupancy < 0.5:
+            reasoning.append(
+                f"[PRIORITY 1: SAFETY OVERRIDE] HIGH WASTE confirmed, but occupancy "
+                f"sensor confidence is {int(occupancy_confidence*100)}% — below the "
+                f"50% threshold for autonomous action. Risk of acting on a false-empty "
+                f"reading (e.g. sleeping occupant). Autonomous action suspended. "
+                f"Priority 1 (Safety) overrides Priority 3 (Efficiency)."
+            )
+            # Surface the full STRIPS plan as non-binding recommendations so the
+            # operator sees what would have been done (including TV shutoff), not
+            # just the limited MEDIUM WASTE advisory set.
+            _safety_planner = StripsPlanner()
+            _safety_plan    = _safety_planner.plan(start_state, temperature, time_of_day)
+            medium_recommendations = [f"SUGGEST_{a}" for a in _safety_plan]
+            if medium_recommendations:
+                reasoning.append(
+                    f"[ADVISORY] Non-binding recommendations (safety override): "
+                    f"{medium_recommendations}. No plan executed."
+                )
+
+        elif autonomy_level == 'advisory':
+            reasoning.append(
+                "[DECISION] HIGH WASTE confirmed. Autonomy is ADVISORY — STRIPS plan "
+                "computed for display, but no actions will be executed."
+            )
+            planner         = StripsPlanner()
+            action_sequence = planner.plan(start_state, temperature, time_of_day)
+            # Surface plan as recommendations without executing
+            medium_recommendations = [f"SUGGEST_{a}" for a in action_sequence]
+            action_sequence = []
+
+        elif autonomy_level == 'confirm':
+            planner         = StripsPlanner()
+            action_sequence = planner.plan(start_state, temperature, time_of_day)
+            awaiting_confirmation = True
+            reasoning.append(
+                f"[DECISION] HIGH WASTE confirmed. Autonomy is CONFIRM — STRIPS plan "
+                f"ready ({action_sequence}), but execution is suspended pending "
+                f"human approval. No changes applied yet."
+            )
+
+        else:  # autonomous
+            planner = StripsPlanner()
+            reasoning.append(
+                "[DECISION] HIGH WASTE confirmed. Autonomy is AUTONOMOUS. "
+                "Initiating STRIPS forward-search planner (BFS, 4-variable state space)."
+            )
+            action_sequence = planner.plan(start_state, temperature, time_of_day)
+            if action_sequence:
+                reasoning.append(
+                    f"[STRIPS] Optimal plan found: {action_sequence} "
+                    f"({len(action_sequence)} action(s)). Applying to device state."
+                )
+            else:
+                reasoning.append(
+                    "[STRIPS] Start state already satisfies goal. No actions needed."
+                )
+
+    # ── STEP 8: Apply actions (autonomous, non-pending only) ─────────────────
+    if action_sequence and not awaiting_confirmation:
         final_state = apply_actions_to_state(start_state, action_sequence)
         final_watt  = calculate_post_action_watt(final_state, temperature)
+        saved       = max(0, initial_watt - final_watt)
+        reasoning.append(
+            f"[EXECUTION] {len(action_sequence)} action(s) applied. "
+            f"Draw: {initial_watt} W → {final_watt} W ({saved} W saved)."
+        )
     else:
         final_state = dict(start_state)
         final_watt  = initial_watt
-
-    # Step 8: Generate human-readable reasoning trace
-    reasoning = get_reasoning(
-        waste_category, start_state, action_sequence,
-        temperature, time_of_day, medium_recommendations
-    )
 
     return {
         'fuzzy_score'           : round(fuzzy_score, 2),
@@ -545,4 +697,8 @@ def core_koswatt_agent(occupancy, temperature, time_of_day,
         'final_watt'            : final_watt,
         'medium_recommendations': medium_recommendations,
         'reasoning'             : reasoning,
+        'autonomy_level'        : autonomy_level,
+        'occupancy_confidence'  : occupancy_confidence,
+        'effective_occupancy'   : round(effective_occupancy, 3),
+        'awaiting_confirmation' : awaiting_confirmation,
     }

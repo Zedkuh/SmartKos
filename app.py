@@ -9,10 +9,13 @@ import streamlit as st
 import plotly.graph_objects as go
 import numpy as np
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 from koswatt_agent import (
     core_koswatt_agent,
+    apply_actions_to_state,
+    calculate_post_action_watt,
     AC_ECO_THRESHOLD,
     AC_ECO_WATTS,
     AC_HOT_WATTS,
@@ -20,6 +23,7 @@ from koswatt_agent import (
     LAMP_WATTS,
     TV_WATTS,
     STANDBY_WATTS,
+    AUTONOMY_LEVELS,
 )
 
 # ── Human-readable labels ─────────────────────────────────────────────────────
@@ -31,8 +35,20 @@ ACTION_LABELS = {
     'SET_AC_TO_ECO'  : 'Set AC to ECO mode',
 }
 ADVISORY_LABELS = {
-    'SUGGEST_AC_ECO'   : 'Switch AC to ECO mode',
-    'SUGGEST_LAMP_OFF' : 'Consider turning off the lamp',
+    'SUGGEST_AC_ECO'           : 'Switch AC to ECO mode',
+    'SUGGEST_LAMP_OFF'         : 'Consider turning off the lamp',
+    # Advisory-mode labels (agent suggests but does not execute STRIPS actions)
+    'SUGGEST_TURN_OFF_TV'      : 'Turn off TV',
+    'SUGGEST_TURN_OFF_LAMP'    : 'Turn off lamp',
+    'SUGGEST_TURN_OFF_AC'      : 'Turn off AC unit',
+    'SUGGEST_TURN_OFF_AC_ECO'  : 'Turn off AC unit (was in ECO mode)',
+    'SUGGEST_SET_AC_TO_ECO'    : 'Set AC to ECO mode',
+}
+
+AUTONOMY_DISPLAY = {
+    'autonomous': '⚡  Autonomous',
+    'confirm':    '✋  Confirm First',
+    'advisory':   '👁  Advisory Only',
 }
 
 
@@ -316,6 +332,64 @@ st.markdown("""
         padding-bottom: 6px;
     }
 
+    /* ── Pending confirmation panel ── */
+    .panel-confirm {
+        background: #0d0d1f;
+        border: 1px solid #2a2a5a;
+        border-left: 4px solid #818cf8;
+        border-radius: 4px;
+        padding: 1.5rem 2rem;
+    }
+    .action-item-pending {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.9rem;
+        color: #818cf8;
+        padding: 7px 0;
+        border-bottom: 1px solid #1a1a3a;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .action-item-pending:last-child { border-bottom: none; }
+
+    /* ── Safety override panel ── */
+    .panel-safety {
+        background: #1a0d1f;
+        border: 1px solid #4a2a5a;
+        border-left: 4px solid #c084fc;
+        border-radius: 4px;
+        padding: 1.5rem 2rem;
+    }
+
+    /* ── Autonomy level badge ── */
+    .autonomy-badge {
+        display: inline-block;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.65rem;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        padding: 3px 10px;
+        border-radius: 2px;
+        margin-bottom: 1rem;
+    }
+    .autonomy-advisory  { background: #0d1520; color: #38bdf8; border: 1px solid #1a2d40; }
+    .autonomy-confirm   { background: #0d0d1f; color: #818cf8; border: 1px solid #2a2a5a; }
+    .autonomy-autonomous{ background: #1f0d0d; color: #f87171; border: 1px solid #4a1f1f; }
+
+    /* ── Confidence indicator ── */
+    .confidence-bar-wrap {
+        margin: 6px 0 2px;
+        height: 4px;
+        background: #1e1e1e;
+        border-radius: 2px;
+        overflow: hidden;
+    }
+    .confidence-bar-fill {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.3s;
+    }
+
     /* ── Session stats (sidebar) ── */
     .stat-row {
         display: flex;
@@ -348,119 +422,6 @@ st.markdown("""
     <p class="kw-subtitle">Smart Energy Agentic AI &nbsp;|&nbsp; Boarding House Energy Monitor</p>
 </div>
 """, unsafe_allow_html=True)
-
-
-# ── Sidebar: Simulation Controls ──────────────────────────────────────────────
-with st.sidebar:
-    st.markdown(
-        '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
-        ' font-weight:600; color:#fff; margin-bottom:4px;">Simulation Control</p>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<p style="font-size:0.75rem; color:#555; margin-bottom:1.5rem;">'
-        'Configure room parameters to test the AI agent</p>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown('<p class="sidebar-section">Room State</p>', unsafe_allow_html=True)
-
-    occupancy_opt = st.radio(
-        "Occupancy",
-        options=["Room Empty", "Room Occupied"],
-        index=0
-    )
-    occupancy = 0 if occupancy_opt == "Room Empty" else 1
-
-    temperature = st.slider(
-        "Room Temperature (C)",
-        min_value=20, max_value=40, value=28, step=1
-    )
-
-    time_opt = st.radio(
-        "Time of Day",
-        options=["Daytime", "Nighttime"],
-        index=0
-    )
-    time_of_day = 0 if time_opt == "Daytime" else 1
-
-    st.markdown('<p class="sidebar-section">Device Switch State</p>', unsafe_allow_html=True)
-    st.caption("Initial state before AI intervention")
-
-    status_ac   = st.toggle("AC Unit", value=True)
-    status_ac_eco = st.toggle("AC in ECO mode", value=False, disabled=not status_ac)
-    status_lamp = st.toggle("Lamp",    value=False)
-    status_tv   = st.toggle("TV",      value=True)
-
-    # ── Session stats ─────────────────────────────────────────────────────────
-    st.markdown('<p class="sidebar-section">Session Stats</p>', unsafe_allow_html=True)
-
-    log = st.session_state.log
-    total_readings  = len(log)
-    high_events     = sum(1 for e in log if e['waste_category'] == 'HIGH WASTE')
-    medium_events   = sum(1 for e in log if e['waste_category'] == 'MEDIUM WASTE')
-    avg_saved_watts = (
-        round(sum(e['watt_saved'] for e in log if e['waste_category'] == 'HIGH WASTE') / high_events)
-        if high_events else 0
-    )
-
-    st.markdown(f"""
-    <div style="padding: 4px 0;">
-        <div class="stat-row">
-            <span class="stat-label">Readings</span>
-            <span class="stat-value">{total_readings}</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">High waste events</span>
-            <span class="stat-value">{high_events}</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">Medium waste events</span>
-            <span class="stat-value">{medium_events}</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">Avg W saved per action</span>
-            <span class="stat-value">{avg_saved_watts} W</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ── Core computation ──────────────────────────────────────────────────────────
-result = core_koswatt_agent(
-    occupancy    = occupancy,
-    temperature  = temperature,
-    time_of_day  = time_of_day,
-    status_ac    = status_ac,
-    status_lamp  = status_lamp,
-    status_tv    = status_tv,
-    status_ac_eco = status_ac_eco
-)
-
-fuzzy_score    = result['fuzzy_score']
-waste_category = result['waste_category']
-action_seq     = result['action_sequence']
-initial_watt   = result['initial_watt']
-final_state    = result['final_state']
-final_watt     = result['final_watt']
-medium_recs    = result['medium_recommendations']
-reasoning      = result['reasoning']
-
-
-# ── Session logging (deduplicated by input hash) ──────────────────────────────
-current_hash = (occupancy, temperature, time_of_day, status_ac, status_ac_eco, status_lamp, status_tv)
-if current_hash != st.session_state.last_log_hash:
-    st.session_state.last_log_hash = current_hash
-    st.session_state.log.append({
-        'waste_category': waste_category,
-        'initial_watt'  : initial_watt,
-        'final_watt'    : final_watt,
-        'watt_saved'    : initial_watt - final_watt,
-        'fuzzy_score'   : fuzzy_score,
-    })
-    if len(st.session_state.log) > 100:
-        st.session_state.log = st.session_state.log[-100:]
-        total_readings = "100+"
 
 
 # ── Gauge chart builder ───────────────────────────────────────────────────────
@@ -522,6 +483,177 @@ def device_pill(label, is_on, is_eco=False):
     return f'<div class="device-row">{badge} <span style="color:#aaa">{label}</span></div>'
 
 
+# ── Sidebar: Simulation Controls ──────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(
+        '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
+        ' font-weight:600; color:#fff; margin-bottom:4px;">Simulation Control</p>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<p style="font-size:0.75rem; color:#555; margin-bottom:1.5rem;">'
+        'Configure room parameters to test the AI agent</p>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown('<p class="sidebar-section">Room State</p>', unsafe_allow_html=True)
+
+    occupancy_opt = st.radio(
+        "Occupancy",
+        options=["Room Empty", "Room Occupied"],
+        index=0
+    )
+    occupancy = 0 if occupancy_opt == "Room Empty" else 1
+
+    temperature = st.slider(
+        "Room Temperature (C)",
+        min_value=20, max_value=40, value=28, step=1
+    )
+
+    time_opt = st.radio(
+        "Time of Day",
+        options=["Daytime", "Nighttime"],
+        index=0
+    )
+    time_of_day = 0 if time_opt == "Daytime" else 1
+
+    st.markdown('<p class="sidebar-section">Device Switch State</p>', unsafe_allow_html=True)
+    st.caption("Initial state before AI intervention")
+
+    status_ac   = st.toggle("AC Unit", value=True)
+    # When AC is switched off, explicitly clear the ECO session state so the
+    # toggle resets to unchecked rather than rendering as checked-but-disabled.
+    if not status_ac:
+        st.session_state['_ac_eco'] = False
+    status_ac_eco = st.toggle("AC in ECO mode", key='_ac_eco', value=False, disabled=not status_ac)
+    status_lamp = st.toggle("Lamp",    value=False)
+    status_tv   = st.toggle("TV",      value=True)
+
+    # ── Agent Settings ────────────────────────────────────────────────────────
+    st.markdown('<p class="sidebar-section">Agent Settings</p>', unsafe_allow_html=True)
+
+    autonomy_choice = st.radio(
+        "Autonomy Level",
+        options=list(AUTONOMY_DISPLAY.keys()),
+        index=0,
+        format_func=lambda x: AUTONOMY_DISPLAY[x],
+    )
+    autonomy_level = autonomy_choice
+    st.caption(AUTONOMY_LEVELS[autonomy_level])
+
+    # Confidence slider — only meaningful when room reads empty
+    if occupancy == 0:
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        occupancy_confidence = st.slider(
+            "Sensor Confidence",
+            min_value=0.0, max_value=1.0, value=1.0, step=0.05,
+            help="How confident is the occupancy sensor in its 'empty' reading? "
+                 "Lower values make the agent more conservative (e.g. sleeping person)."
+        )
+        conf_pct   = int(occupancy_confidence * 100)
+        if occupancy_confidence >= 0.8:
+            bar_color = "#4ade80"
+        elif occupancy_confidence >= 0.5:
+            bar_color = "#fbbf24"
+        else:
+            bar_color = "#f87171"
+        st.markdown(f"""
+        <div style="font-family: IBM Plex Mono, monospace; font-size: 0.7rem; color: #555; margin-top:-4px;">
+            Confidence: <span style="color:{bar_color}">{conf_pct}%</span>
+        </div>
+        <div class="confidence-bar-wrap">
+            <div class="confidence-bar-fill"
+                 style="width:{conf_pct}%; background:{bar_color};"></div>
+        </div>
+        """, unsafe_allow_html=True)
+        if occupancy_confidence < 0.5:
+            st.caption("⚠ Below 50% — autonomous action suspended (safety override).")
+    else:
+        occupancy_confidence = 1.0
+
+    # ── Session stats ─────────────────────────────────────────────────────────
+    st.markdown('<p class="sidebar-section">Session Stats</p>', unsafe_allow_html=True)
+
+    log = st.session_state.log
+    total_readings  = f"{len(log)}+" if len(log) >= 100 else len(log)
+    high_events     = sum(1 for e in log if e['waste_category'] == 'HIGH WASTE')
+    medium_events   = sum(1 for e in log if e['waste_category'] == 'MEDIUM WASTE')
+    avg_saved_watts = (
+        round(sum(e['watt_saved'] for e in log if e['waste_category'] == 'HIGH WASTE') / high_events)
+        if high_events else 0
+    )
+
+    st.markdown(f"""
+    <div style="padding: 4px 0;">
+        <div class="stat-row">
+            <span class="stat-label">Readings</span>
+            <span class="stat-value">{total_readings}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">High waste events</span>
+            <span class="stat-value">{high_events}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Medium waste events</span>
+            <span class="stat-value">{medium_events}</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Avg W saved per action</span>
+            <span class="stat-value">{avg_saved_watts} W</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ── Core computation ──────────────────────────────────────────────────────────
+result = core_koswatt_agent(
+    occupancy            = occupancy,
+    temperature          = temperature,
+    time_of_day          = time_of_day,
+    status_ac            = status_ac,
+    status_lamp          = status_lamp,
+    status_tv            = status_tv,
+    status_ac_eco        = status_ac_eco,
+    autonomy_level       = autonomy_level,
+    occupancy_confidence = occupancy_confidence,
+)
+
+fuzzy_score           = result['fuzzy_score']
+waste_category        = result['waste_category']
+action_seq            = result['action_sequence']
+initial_watt          = result['initial_watt']
+final_state           = result['final_state']
+final_watt            = result['final_watt']
+medium_recs           = result['medium_recommendations']
+reasoning             = result['reasoning']
+awaiting_confirmation = result['awaiting_confirmation']
+effective_occupancy   = result['effective_occupancy']
+
+
+# ── Session logging (deduplicated by input hash) ──────────────────────────────
+current_hash = (occupancy, temperature, time_of_day, status_ac, status_ac_eco,
+                status_lamp, status_tv, autonomy_level, occupancy_confidence)
+if current_hash != st.session_state.last_log_hash:
+    st.session_state.last_log_hash = current_hash
+    # For advisory/confirm modes, final_watt == initial_watt (no actions applied).
+    # Simulate what the plan would save so the session stat remains meaningful.
+    if action_seq:
+        _sim_state = apply_actions_to_state(final_state, action_seq)
+        _sim_watt  = calculate_post_action_watt(_sim_state, temperature)
+        _log_saved = max(0, initial_watt - _sim_watt)
+    else:
+        _log_saved = max(0, initial_watt - final_watt)
+    st.session_state.log.append({
+        'waste_category': waste_category,
+        'initial_watt'  : initial_watt,
+        'final_watt'    : final_watt,
+        'watt_saved'    : _log_saved,
+        'fuzzy_score'   : fuzzy_score,
+    })
+    if len(st.session_state.log) > 100:
+        st.session_state.log = st.session_state.log[-100:]
+
+
 # =============================================================================
 # ROW 01 -- Current Conditions / Before AI Intervention
 # =============================================================================
@@ -547,6 +679,15 @@ with col_a:
 
     occ_text = "Occupied" if occupancy else "Empty"
     tod_text = "Night"    if time_of_day else "Day"
+
+    # Show effective occupancy when sensor confidence has modulated it
+    eff_occ_html = ""
+    if occupancy_confidence < 1.0:
+        conf_pct = int(occupancy_confidence * 100)
+        eff_occ_html = (
+            f'Eff. Occupancy: <span style="color:#fff">{effective_occupancy:.2f}</span>'
+            f' <span style="color:#555; font-size:0.75rem;">({conf_pct}% conf.)</span><br>'
+        )
 
     # Build per-device watt breakdown for the context card
     ac_draw = AC_ECO_WATTS if (status_ac and status_ac_eco) else (
@@ -577,7 +718,8 @@ with col_a:
         <div style="font-family: IBM Plex Mono, monospace; font-size: 0.85rem; line-height: 2; color: #aaa; margin-bottom: 0.8rem;">
             Room: <span style="color:#fff">{occ_text}</span><br>
             Temp: <span style="color:#fff">{temperature} C</span><br>
-            Time: <span style="color:#fff">{tod_text}</span>
+            Time: <span style="color:#fff">{tod_text}</span><br>
+            {eff_occ_html}
         </div>
         <div style="border-top: 1px solid #1e1e1e; padding-top: 0.6rem;">
             <div style="font-size:0.65rem; letter-spacing:1.5px; color:#444; text-transform:uppercase; margin-bottom:6px;">Draw Breakdown</div>
@@ -613,11 +755,30 @@ with col_c:
         <span style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem;
                      padding: 4px 16px; border-radius: 2px; letter-spacing: 2px;
                      {badge_style}">{waste_category}</span>
+        <br>
+        <span class="autonomy-badge autonomy-{autonomy_level}" style="margin-top:6px;">
+            {AUTONOMY_DISPLAY[autonomy_level]}
+        </span>
     </div>
     </div>
     """, unsafe_allow_html=True)
 
 st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
+
+
+# ── Helper: renders an action/suggestion list as HTML ─────────────────────────
+def _actions_html(items, label_map, item_css_class):
+    html = ""
+    for i, item in enumerate(items, 1):
+        label = label_map.get(item, item)
+        html += f"""
+        <div class="{item_css_class}">
+            <span class="action-index">{i:02d}</span>
+            <span>{label}</span>
+        </div>"""
+    if not html:
+        html = '<p style="color:#555; font-size:0.85rem;">No further actions required.</p>'
+    return html
 
 
 # =============================================================================
@@ -693,56 +854,143 @@ elif waste_category == 'MEDIUM WASTE':
         """, unsafe_allow_html=True)
 
 else:
-    # HIGH WASTE: STRIPS planner triggered
-    col_left, col_right = st.columns([1.2, 1])
+    # HIGH WASTE — behaviour depends on autonomy level and confidence
 
-    with col_left:
-        actions_html = ""
-        for i, action in enumerate(action_seq, 1):
-            label = ACTION_LABELS.get(action, action)
-            actions_html += f"""
-            <div class="action-item">
-                <span class="action-index">{i:02d}</span>
-                <span>{label}</span>
-            </div>"""
+    # ── Safety override: confidence too low to act ──────────────────────────
+    safety_override_active = (occupancy_confidence < 0.5 and occupancy == 0)
 
-        if not action_seq:
-            actions_html = '<p style="color:#555; font-size:0.85rem;">No further actions required.</p>'
-
+    if safety_override_active:
         st.markdown(f"""
-        <div class="panel-alert">
-            <p class="panel-title" style="color:#f87171">AI Action Triggered</p>
-            <p style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem;
-                      color:#666; margin-bottom:1rem;">
-                STRIPS PLANNER &nbsp; | &nbsp; {len(action_seq)} action(s) queued
+        <div class="panel-safety">
+            <p class="panel-title" style="color:#c084fc">Safety Override Active</p>
+            <p style="font-size:0.95rem; color:#aaa; margin:0 0 0.8rem;">
+                Waste score <strong style="color:#f87171">{fuzzy_score}</strong> qualifies
+                as HIGH WASTE, but the occupancy sensor confidence is only
+                <strong style="color:#c084fc">{int(occupancy_confidence*100)}%</strong>
+                — below the 50% threshold for autonomous action.
             </p>
-            {actions_html}
+            <p style="font-size:0.85rem; color:#7a5a8a; margin:0; font-family: IBM Plex Mono, monospace;">
+                PRIORITY 1: SAFETY &nbsp;|&nbsp; Risk of false-empty reading (e.g. sleeping
+                occupant). Autonomous action suspended. Raise sensor confidence to re-enable.
+            </p>
         </div>
         """, unsafe_allow_html=True)
-
-    with col_right:
-        ac_eco   = final_state.get('ac_eco', False)
-        ac_on    = final_state.get('ac_on',  False)
-        lamp_on  = final_state.get('lamp_on', False)
-        tv_on    = final_state.get('tv_on',  False)
-
-        ac_final   = device_pill("AC Unit", ac_on,  is_eco=ac_eco)
-        lamp_final = device_pill("Lamp",    lamp_on)
-        tv_final   = device_pill("TV",      tv_on)
-
-        watt_saved = initial_watt - final_watt
-
-        st.markdown(f"""
-        <div class="panel-alert">
-            <p class="panel-title" style="color:#f87171">Post-Execution State</p>
-            {ac_final}{lamp_final}{tv_final}
-            <div class="watt-delta">
-                <span class="watt-before">{initial_watt} W</span>
-                <span class="watt-after">{final_watt} W</span>
-                <span class="watt-saved">-{watt_saved} W saved</span>
+        if medium_recs:
+            adv_html = _actions_html(medium_recs, ADVISORY_LABELS, 'advisory-item')
+            st.markdown(f"""
+            <div class="panel-advisory">
+                <p class="panel-title" style="color:#38bdf8; margin-bottom:0.8rem;">
+                    Non-Binding Recommendations (Safety Override)
+                </p>
+                {adv_html}
             </div>
+            """, unsafe_allow_html=True)
+
+    # ── Advisory: no execution, show recommendations ────────────────────────
+    elif autonomy_level == 'advisory':
+        adv_html = _actions_html(medium_recs, ADVISORY_LABELS, 'advisory-item') if medium_recs else \
+                   '<p style="color:#555; font-size:0.85rem;">No recommendations generated.</p>'
+        st.markdown(f"""
+        <div class="panel-advisory">
+            <p class="panel-title" style="color:#38bdf8">Advisory Mode — No Action Taken</p>
+            <p style="font-size:0.95rem; color:#aaa; margin:0 0 0.8rem;">
+                Waste score <strong style="color:#f87171">{fuzzy_score}</strong> qualifies
+                as HIGH WASTE. Autonomy is <strong style="color:#38bdf8">ADVISORY</strong>
+                — the STRIPS plan has been computed but will not execute.
+                Devices remain unchanged.
+            </p>
+            {adv_html}
         </div>
         """, unsafe_allow_html=True)
+
+    # ── Confirm: plan ready, awaiting approval ──────────────────────────────
+    elif awaiting_confirmation:
+        col_left, col_right = st.columns([1.2, 1])
+
+        with col_left:
+            pending_html = _actions_html(action_seq, ACTION_LABELS, 'action-item-pending')
+            st.markdown(f"""
+            <div class="panel-confirm">
+                <p class="panel-title" style="color:#818cf8">Awaiting Confirmation</p>
+                <p style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem;
+                          color:#444; margin-bottom:1rem;">
+                    STRIPS PLANNER &nbsp;|&nbsp; {len(action_seq)} action(s) pending approval
+                </p>
+                {pending_html}
+                <p style="font-size:0.75rem; color:#444; margin-top:1rem; margin-bottom:0;
+                          font-family: IBM Plex Mono, monospace;">
+                    Devices unchanged until approved. Switch to AUTONOMOUS to auto-execute.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col_right:
+            ac_eco  = final_state.get('ac_eco', False)
+            ac_on   = final_state.get('ac_on',  False)
+            lamp_on = final_state.get('lamp_on', False)
+            tv_on   = final_state.get('tv_on',  False)
+            # In confirm mode, final_state == start_state (nothing executed yet).
+            # Simulate what post-approval draw would be.
+            projected_state = apply_actions_to_state(final_state, action_seq)
+            projected_watt  = calculate_post_action_watt(projected_state, temperature)
+            watt_saved_projected = max(0, initial_watt - projected_watt)
+            ac_f    = device_pill("AC Unit", ac_on,  is_eco=ac_eco)
+            lamp_f  = device_pill("Lamp",    lamp_on)
+            tv_f    = device_pill("TV",      tv_on)
+            st.markdown(f"""
+            <div class="panel-confirm">
+                <p class="panel-title" style="color:#818cf8">Current State (Unchanged)</p>
+                {ac_f}{lamp_f}{tv_f}
+                <div class="watt-delta">
+                    <span class="watt-before" style="text-decoration:none; color:#818cf8;">{initial_watt} W</span>
+                    <span style="font-family: IBM Plex Mono, monospace; font-size:0.8rem; color:#444;">
+                        → {projected_watt} W if approved
+                        <span style="color:#818cf8">({watt_saved_projected} W saved)</span>
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ── Autonomous: STRIPS executed ─────────────────────────────────────────
+    else:
+        col_left, col_right = st.columns([1.2, 1])
+
+        with col_left:
+            actions_html = _actions_html(action_seq, ACTION_LABELS, 'action-item')
+            st.markdown(f"""
+            <div class="panel-alert">
+                <p class="panel-title" style="color:#f87171">AI Action Triggered</p>
+                <p style="font-family: IBM Plex Mono, monospace; font-size: 0.75rem;
+                          color:#666; margin-bottom:1rem;">
+                    STRIPS PLANNER &nbsp; | &nbsp; {len(action_seq)} action(s) executed
+                </p>
+                {actions_html}
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col_right:
+            ac_eco   = final_state.get('ac_eco', False)
+            ac_on    = final_state.get('ac_on',  False)
+            lamp_on  = final_state.get('lamp_on', False)
+            tv_on    = final_state.get('tv_on',  False)
+
+            ac_final   = device_pill("AC Unit", ac_on,  is_eco=ac_eco)
+            lamp_final = device_pill("Lamp",    lamp_on)
+            tv_final   = device_pill("TV",      tv_on)
+
+            watt_saved = max(0, initial_watt - final_watt)
+
+            st.markdown(f"""
+            <div class="panel-alert">
+                <p class="panel-title" style="color:#f87171">Post-Execution State</p>
+                {ac_final}{lamp_final}{tv_final}
+                <div class="watt-delta">
+                    <span class="watt-before">{initial_watt} W</span>
+                    <span class="watt-after">{final_watt} W</span>
+                    <span class="watt-saved">-{watt_saved} W saved</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
