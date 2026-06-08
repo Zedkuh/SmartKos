@@ -8,6 +8,7 @@ Entry point: streamlit run app.py
 import streamlit as st
 import plotly.graph_objects as go
 import numpy as np
+import pandas as pd
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -66,6 +67,10 @@ if 'log' not in st.session_state:
     st.session_state.log = []
 if 'last_log_hash' not in st.session_state:
     st.session_state.last_log_hash = None
+if '_dataset' not in st.session_state:
+    st.session_state['_dataset'] = None
+if '_batch_results' not in st.session_state:
+    st.session_state['_batch_results'] = None
 
 
 # ── Global styles ─────────────────────────────────────────────────────────────
@@ -445,6 +450,7 @@ def build_gauge(score):
                 'range'    : [0, 100],
                 'tickwidth': 1,
                 'tickcolor': "#333",
+                'tickvals' : [0, 35, 65, 100],
                 'tickfont' : {'color': '#444', 'size': 10},
             },
             'bar'       : {'color': needle_color, 'thickness': 0.22},
@@ -485,6 +491,86 @@ def device_pill(label, is_on, is_eco=False):
 
 # ── Sidebar: Simulation Controls ──────────────────────────────────────────────
 with st.sidebar:
+
+    # ── Dataset section ───────────────────────────────────────────────────────
+    st.markdown(
+        '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
+        ' font-weight:600; color:#fff; margin-bottom:4px;">Dataset</p>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<p style="font-size:0.75rem; color:#555; margin-bottom:0.75rem;">'
+        'Load boarding_house_dataset.csv to replay real rows</p>',
+        unsafe_allow_html=True
+    )
+
+    uploaded_file = st.file_uploader("Load CSV", type='csv', label_visibility='collapsed')
+    if uploaded_file is not None:
+        df_uploaded = pd.read_csv(uploaded_file)
+        st.session_state['_dataset']      = df_uploaded
+        st.session_state['_batch_results'] = None   # invalidate cached batch
+
+    if st.session_state['_dataset'] is not None:
+        df_ds  = st.session_state['_dataset']
+        n_rows = len(df_ds)
+        row_idx = st.slider(
+            f"Row (of {n_rows})",
+            min_value=0, max_value=n_rows - 1, value=0, step=1,
+            key='_row_slider'
+        )
+        preview = df_ds.iloc[row_idx]
+        st.markdown(
+            f'<p style="font-family: IBM Plex Mono, monospace; font-size: 0.7rem;'
+            f' color:#555; margin:2px 0;">'
+            f'{preview["date"]} &nbsp; {preview["time"]} &nbsp;|&nbsp; '
+            f'{preview["global_active_power"]} kW</p>',
+            unsafe_allow_html=True
+        )
+        if st.button("Load Row into Controls", use_container_width=True):
+            row = df_ds.iloc[row_idx]
+            st.session_state['_occ_radio']   = 'Room Occupied' if int(row['occupancy']) == 1 else 'Room Empty'
+            st.session_state['_temp_slider'] = int(row['temperature'])
+            st.session_state['_tod_radio']   = 'Nighttime' if float(row['time_of_day']) >= 0.5 else 'Daytime'
+            st.session_state['_ac_on']       = bool(int(row['ac_on']))
+            st.session_state['_ac_eco']      = bool(int(row['ac_eco'])) if int(row['ac_on']) else False
+            st.session_state['_lamp']        = bool(int(row['lamp_on']))
+            st.session_state['_tv']          = bool(int(row['tv_on']))
+            st.session_state['_conf_slider'] = float(row['occupancy_confidence'])
+            st.rerun()
+
+        if st.button("Run Batch Analysis", use_container_width=True):
+            progress = st.progress(0, text="Running agent on dataset rows...")
+            results  = []
+            sample   = df_ds.head(500)   # cap at 500 for UI responsiveness
+            for i, (_, row) in enumerate(sample.iterrows()):
+                res = core_koswatt_agent(
+                    occupancy            = int(row['occupancy']),
+                    temperature          = int(row['temperature']),
+                    time_of_day          = float(row['time_of_day']),
+                    status_ac            = bool(int(row['ac_on'])),
+                    status_ac_eco        = bool(int(row['ac_eco'])),
+                    status_lamp          = bool(int(row['lamp_on'])),
+                    status_tv            = bool(int(row['tv_on'])),
+                    autonomy_level       = 'autonomous',
+                    occupancy_confidence = float(row['occupancy_confidence']),
+                )
+                results.append({
+                    'waste_category' : res['waste_category'],
+                    'fuzzy_score'    : res['fuzzy_score'],
+                    'actions'        : res['action_sequence'],
+                    'watt_before'    : res['initial_watt'],
+                    'watt_after'     : res['final_watt'],
+                    'watt_saved'     : max(0, res['initial_watt'] - res['final_watt']),
+                })
+                if i % 50 == 0:
+                    progress.progress((i + 1) / len(sample),
+                                      text=f"Row {i+1}/{len(sample)}…")
+            progress.empty()
+            st.session_state['_batch_results'] = results
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.markdown('<hr style="border-color:#1e1e1e; margin: 0.5rem 0 1rem;">', unsafe_allow_html=True)
+
     st.markdown(
         '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
         ' font-weight:600; color:#fff; margin-bottom:4px;">Simulation Control</p>',
@@ -501,33 +587,34 @@ with st.sidebar:
     occupancy_opt = st.radio(
         "Occupancy",
         options=["Room Empty", "Room Occupied"],
-        index=0
+        index=0,
+        key='_occ_radio'
     )
     occupancy = 0 if occupancy_opt == "Room Empty" else 1
 
     temperature = st.slider(
         "Room Temperature (C)",
-        min_value=20, max_value=40, value=28, step=1
+        min_value=20, max_value=40, value=28, step=1,
+        key='_temp_slider'
     )
 
     time_opt = st.radio(
         "Time of Day",
         options=["Daytime", "Nighttime"],
-        index=0
+        index=0,
+        key='_tod_radio'
     )
     time_of_day = 0 if time_opt == "Daytime" else 1
 
     st.markdown('<p class="sidebar-section">Device Switch State</p>', unsafe_allow_html=True)
     st.caption("Initial state before AI intervention")
 
-    status_ac   = st.toggle("AC Unit", value=True)
-    # When AC is switched off, explicitly clear the ECO session state so the
-    # toggle resets to unchecked rather than rendering as checked-but-disabled.
+    status_ac   = st.toggle("AC Unit", value=True,  key='_ac_on')
     if not status_ac:
         st.session_state['_ac_eco'] = False
     status_ac_eco = st.toggle("AC in ECO mode", key='_ac_eco', value=False, disabled=not status_ac)
-    status_lamp = st.toggle("Lamp",    value=False)
-    status_tv   = st.toggle("TV",      value=True)
+    status_lamp = st.toggle("Lamp", value=False, key='_lamp')
+    status_tv   = st.toggle("TV",   value=True,  key='_tv')
 
     # ── Agent Settings ────────────────────────────────────────────────────────
     st.markdown('<p class="sidebar-section">Agent Settings</p>', unsafe_allow_html=True)
@@ -547,6 +634,7 @@ with st.sidebar:
         occupancy_confidence = st.slider(
             "Sensor Confidence",
             min_value=0.0, max_value=1.0, value=1.0, step=0.05,
+            key='_conf_slider',
             help="How confident is the occupancy sensor in its 'empty' reading? "
                  "Lower values make the agent more conservative (e.g. sleeping person)."
         )
@@ -635,9 +723,11 @@ current_hash = (occupancy, temperature, time_of_day, status_ac, status_ac_eco,
                 status_lamp, status_tv, autonomy_level, occupancy_confidence)
 if current_hash != st.session_state.last_log_hash:
     st.session_state.last_log_hash = current_hash
-    # For advisory/confirm modes, final_watt == initial_watt (no actions applied).
-    # Simulate what the plan would save so the session stat remains meaningful.
-    if action_seq:
+    # Confirm mode: final_state == start_state (nothing executed yet).
+    # Simulate projected savings so the session stat remains meaningful.
+    # Autonomous mode: final_state already has actions applied — use final_watt
+    # directly.  Advisory mode: action_seq is always [] so the else branch runs.
+    if action_seq and awaiting_confirmation:
         _sim_state = apply_actions_to_state(final_state, action_seq)
         _sim_watt  = calculate_post_action_watt(_sim_state, temperature)
         _log_saved = max(0, initial_watt - _sim_watt)
@@ -857,7 +947,12 @@ else:
     # HIGH WASTE — behaviour depends on autonomy level and confidence
 
     # ── Safety override: confidence too low to act ──────────────────────────
-    safety_override_active = (occupancy_confidence < 0.5 and occupancy == 0)
+    # Checked here (not only in the agent) so the correct panel is shown even
+    # when the fuzzy dead zone (effective_occupancy=0.5 at confidence=0) caused
+    # the agent to classify LOW/MEDIUM rather than HIGH.  The agent's reasoning
+    # trace will already contain the PRIORITY 1: SAFETY OVERRIDE entry.
+    # Uses < 0.5 (not == 0) to match the agent's own condition.
+    safety_override_active = (occupancy_confidence < 0.5 and occupancy < 0.5)
 
     if safety_override_active:
         st.markdown(f"""
@@ -1016,6 +1111,113 @@ st.markdown(f"""
     {reasoning_lines_html}
 </div>
 """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# ROW 04 -- Batch Dataset Analysis
+# =============================================================================
+batch_results = st.session_state.get('_batch_results')
+if batch_results:
+    st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
+    st.markdown(
+        '<p class="section-label">04 &nbsp; Batch Dataset Analysis</p>',
+        unsafe_allow_html=True
+    )
+
+    n_batch      = len(batch_results)
+    cats         = [r['waste_category'] for r in batch_results]
+    low_n        = cats.count('LOW WASTE')
+    med_n        = cats.count('MEDIUM WASTE')
+    high_n       = cats.count('HIGH WASTE')
+    total_saved  = sum(r['watt_saved'] for r in batch_results)
+    all_actions  = [a for r in batch_results for a in r['actions']]
+    action_counts = {}
+    for a in all_actions:
+        action_counts[a] = action_counts.get(a, 0) + 1
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    for col, label, val, color in [
+        (col_a, "Rows Processed",   str(n_batch),           "#aaa"),
+        (col_b, "HIGH WASTE",       str(high_n),            "#f87171"),
+        (col_c, "MEDIUM WASTE",     str(med_n),             "#fbbf24"),
+        (col_d, "Total W Saved",    f"{total_saved:,} W",   "#4ade80"),
+    ]:
+        col.markdown(f"""
+        <div style="background:#111; border:1px solid #1e1e1e; border-radius:8px;
+                    padding:1rem; text-align:center;">
+            <p style="font-family: IBM Plex Mono, monospace; font-size:0.7rem;
+                      color:#555; margin:0 0 0.3rem; letter-spacing:1px;">{label}</p>
+            <p style="font-size:1.4rem; font-weight:700; color:{color}; margin:0;">{val}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+    col_chart1, col_chart2 = st.columns(2)
+
+    with col_chart1:
+        fig_cat = go.Figure(go.Bar(
+            x     = ['LOW WASTE', 'MEDIUM WASTE', 'HIGH WASTE'],
+            y     = [low_n, med_n, high_n],
+            marker_color = ['#4ade80', '#fbbf24', '#f87171'],
+            text  = [low_n, med_n, high_n],
+            textposition = 'outside',
+            textfont     = {'color': '#aaa', 'size': 11,
+                            'family': 'IBM Plex Mono'},
+        ))
+        fig_cat.update_layout(
+            title      = dict(text='Waste Classification Distribution',
+                              font=dict(color='#555', size=12,
+                                        family='IBM Plex Mono'),
+                              x=0),
+            paper_bgcolor = 'rgba(0,0,0,0)',
+            plot_bgcolor  = 'rgba(0,0,0,0)',
+            xaxis = dict(tickfont=dict(color='#555', size=10,
+                                       family='IBM Plex Mono'),
+                         showgrid=False),
+            yaxis = dict(tickfont=dict(color='#555', size=10),
+                         gridcolor='#1e1e1e', showgrid=True),
+            margin = dict(l=10, r=10, t=40, b=10),
+            height = 260,
+        )
+        st.plotly_chart(fig_cat, use_container_width=True)
+
+    with col_chart2:
+        if action_counts:
+            labels = [ACTION_LABELS.get(k, k) for k in action_counts]
+            values = list(action_counts.values())
+            fig_act = go.Figure(go.Bar(
+                x    = values,
+                y    = labels,
+                orientation  = 'h',
+                marker_color = '#818cf8',
+                text         = values,
+                textposition = 'outside',
+                textfont     = {'color': '#aaa', 'size': 11,
+                                'family': 'IBM Plex Mono'},
+            ))
+            fig_act.update_layout(
+                title      = dict(text='Actions Executed by STRIPS Planner',
+                                  font=dict(color='#555', size=12,
+                                            family='IBM Plex Mono'),
+                                  x=0),
+                paper_bgcolor = 'rgba(0,0,0,0)',
+                plot_bgcolor  = 'rgba(0,0,0,0)',
+                xaxis = dict(tickfont=dict(color='#555', size=10),
+                             gridcolor='#1e1e1e'),
+                yaxis = dict(tickfont=dict(color='#555', size=10,
+                                           family='IBM Plex Mono'),
+                             showgrid=False),
+                margin = dict(l=10, r=10, t=40, b=10),
+                height = 260,
+            )
+            st.plotly_chart(fig_act, use_container_width=True)
+        else:
+            st.markdown(
+                '<p style="color:#555; font-family: IBM Plex Mono, monospace;'
+                ' font-size:0.8rem; padding-top:3rem; text-align:center;">'
+                'No STRIPS actions executed across batch.</p>',
+                unsafe_allow_html=True
+            )
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────
