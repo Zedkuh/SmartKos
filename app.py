@@ -27,7 +27,7 @@ from koswatt_agent import (
     AUTONOMY_LEVELS,
 )
 
-# ── Human-readable labels ─────────────────────────────────────────────────────
+#  Human-readable labels 
 ACTION_LABELS = {
     'TURN_OFF_TV'    : 'Turn off TV',
     'TURN_OFF_LAMP'  : 'Turn off lamp',
@@ -47,13 +47,13 @@ ADVISORY_LABELS = {
 }
 
 AUTONOMY_DISPLAY = {
-    'autonomous': '⚡  Autonomous',
-    'confirm':    '✋  Confirm First',
-    'advisory':   '👁  Advisory Only',
+    'autonomous': 'Autonomous',
+    'confirm':    'Confirm First',
+    'advisory':   'Advisory Only',
 }
 
 
-# ── Page configuration ────────────────────────────────────────────────────────
+#  Page configuration 
 st.set_page_config(
     page_title            = "KosWatt | Smart Energy AI",
     page_icon             = "W",
@@ -62,7 +62,7 @@ st.set_page_config(
 )
 
 
-# ── Session state initialisation ──────────────────────────────────────────────
+#  Session state initialisation 
 if 'log' not in st.session_state:
     st.session_state.log = []
 if 'last_log_hash' not in st.session_state:
@@ -73,7 +73,7 @@ if '_batch_results' not in st.session_state:
     st.session_state['_batch_results'] = None
 
 
-# ── Global styles ─────────────────────────────────────────────────────────────
+#  Global styles 
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
@@ -97,7 +97,7 @@ st.markdown("""
         max-width: 1300px;
     }
 
-    /* ── Header ── */
+    /*  Header  */
     .kw-header {
         border-bottom: 1px solid #2a2a2a;
         padding-bottom: 1.2rem;
@@ -119,7 +119,7 @@ st.markdown("""
         text-transform: uppercase;
     }
 
-    /* ── Section labels ── */
+    /*  Section labels  */
     .section-label {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.7rem;
@@ -131,7 +131,7 @@ st.markdown("""
         border-bottom: 1px solid #1e1e1e;
     }
 
-    /* ── Metric cards ── */
+    /*  Metric cards  */
     .metric-card {
         background: #141414;
         border: 1px solid #222;
@@ -159,7 +159,7 @@ st.markdown("""
         margin-left: 4px;
     }
 
-    /* ── Device status pill ── */
+    /*  Device status pill  */
     .device-row {
         display: flex;
         align-items: center;
@@ -201,7 +201,7 @@ st.markdown("""
         letter-spacing: 1px;
     }
 
-    /* ── Result panels ── */
+    /*  Result panels  */
     .panel-stable {
         background: #0d1f0d;
         border: 1px solid #1f4a1f;
@@ -246,7 +246,7 @@ st.markdown("""
         margin-bottom: 1rem;
     }
 
-    /* ── Action list (HIGH WASTE) ── */
+    /*  Action list (HIGH WASTE)  */
     .action-item {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.9rem;
@@ -266,7 +266,7 @@ st.markdown("""
         min-width: 20px;
     }
 
-    /* ── Advisory action list (MEDIUM WASTE) ── */
+    /*  Advisory action list (MEDIUM WASTE)  */
     .advisory-item {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.85rem;
@@ -284,7 +284,7 @@ st.markdown("""
         margin-top: 2px;
     }
 
-    /* ── Reasoning lines ── */
+    /*  Reasoning lines  */
     .reasoning-line {
         font-size: 0.875rem;
         color: #888888;
@@ -296,7 +296,7 @@ st.markdown("""
         border-bottom: none;
     }
 
-    /* ── Watt delta display ── */
+    /*  Watt delta display  */
     .watt-delta {
         display: flex;
         align-items: baseline;
@@ -325,7 +325,7 @@ st.markdown("""
         border-radius: 2px;
     }
 
-    /* ── Sidebar overrides ── */
+    /*  Sidebar overrides  */
     .sidebar-section {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.65rem;
@@ -337,7 +337,7 @@ st.markdown("""
         padding-bottom: 6px;
     }
 
-    /* ── Pending confirmation panel ── */
+    /*  Pending confirmation panel  */
     .panel-confirm {
         background: #0d0d1f;
         border: 1px solid #2a2a5a;
@@ -357,7 +357,7 @@ st.markdown("""
     }
     .action-item-pending:last-child { border-bottom: none; }
 
-    /* ── Safety override panel ── */
+    /*  Safety override panel  */
     .panel-safety {
         background: #1a0d1f;
         border: 1px solid #4a2a5a;
@@ -366,7 +366,7 @@ st.markdown("""
         padding: 1.5rem 2rem;
     }
 
-    /* ── Autonomy level badge ── */
+    /*  Autonomy level badge  */
     .autonomy-badge {
         display: inline-block;
         font-family: 'IBM Plex Mono', monospace;
@@ -381,7 +381,7 @@ st.markdown("""
     .autonomy-confirm   { background: #0d0d1f; color: #818cf8; border: 1px solid #2a2a5a; }
     .autonomy-autonomous{ background: #1f0d0d; color: #f87171; border: 1px solid #4a1f1f; }
 
-    /* ── Confidence indicator ── */
+    /*  Confidence indicator  */
     .confidence-bar-wrap {
         margin: 6px 0 2px;
         height: 4px;
@@ -395,7 +395,7 @@ st.markdown("""
         transition: width 0.3s;
     }
 
-    /* ── Session stats (sidebar) ── */
+    /*  Session stats (sidebar)  */
     .stat-row {
         display: flex;
         justify-content: space-between;
@@ -420,7 +420,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Header ────────────────────────────────────────────────────────────────────
+#  Header 
 st.markdown("""
 <div class="kw-header">
     <p class="kw-title">KosWatt</p>
@@ -429,7 +429,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Gauge chart builder ───────────────────────────────────────────────────────
+#  Gauge chart builder 
 def build_gauge(score):
     if score <= 35:
         needle_color = "#4ade80"
@@ -478,7 +478,7 @@ def build_gauge(score):
     return fig
 
 
-# ── Device status HTML builder ────────────────────────────────────────────────
+#  Device status HTML builder 
 def device_pill(label, is_on, is_eco=False):
     if is_eco:
         badge = '<span class="pill-eco">ECO</span>'
@@ -489,10 +489,10 @@ def device_pill(label, is_on, is_eco=False):
     return f'<div class="device-row">{badge} <span style="color:#aaa">{label}</span></div>'
 
 
-# ── Sidebar: Simulation Controls ──────────────────────────────────────────────
+#  Sidebar: Simulation Controls 
 with st.sidebar:
 
-    # ── Dataset section ───────────────────────────────────────────────────────
+    #  Dataset section 
     st.markdown(
         '<p style="font-family: IBM Plex Mono, monospace; font-size: 1rem;'
         ' font-weight:600; color:#fff; margin-bottom:4px;">Dataset</p>',
@@ -616,7 +616,7 @@ with st.sidebar:
     status_lamp = st.toggle("Lamp", value=False, key='_lamp')
     status_tv   = st.toggle("TV",   value=True,  key='_tv')
 
-    # ── Agent Settings ────────────────────────────────────────────────────────
+    #  Agent Settings 
     st.markdown('<p class="sidebar-section">Agent Settings</p>', unsafe_allow_html=True)
 
     autonomy_choice = st.radio(
@@ -659,7 +659,7 @@ with st.sidebar:
     else:
         occupancy_confidence = 1.0
 
-    # ── Session stats ─────────────────────────────────────────────────────────
+    #  Session stats 
     st.markdown('<p class="sidebar-section">Session Stats</p>', unsafe_allow_html=True)
 
     log = st.session_state.log
@@ -693,7 +693,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 
-# ── Core computation ──────────────────────────────────────────────────────────
+#  Core computation 
 result = core_koswatt_agent(
     occupancy            = occupancy,
     temperature          = temperature,
@@ -718,7 +718,7 @@ awaiting_confirmation = result['awaiting_confirmation']
 effective_occupancy   = result['effective_occupancy']
 
 
-# ── Session logging (deduplicated by input hash) ──────────────────────────────
+#  Session logging (deduplicated by input hash) 
 current_hash = (occupancy, temperature, time_of_day, status_ac, status_ac_eco,
                 status_lamp, status_tv, autonomy_level, occupancy_confidence)
 if current_hash != st.session_state.last_log_hash:
@@ -770,14 +770,15 @@ with col_a:
     occ_text = "Occupied" if occupancy else "Empty"
     tod_text = "Night"    if time_of_day else "Day"
 
-    # Show effective occupancy when sensor confidence has modulated it
-    eff_occ_html = ""
+    # Show effective occupancy with adaptive confidence fallback
+    conf_pct = int(occupancy_confidence * 100)
     if occupancy_confidence < 1.0:
-        conf_pct = int(occupancy_confidence * 100)
         eff_occ_html = (
             f'Eff. Occupancy: <span style="color:#fff">{effective_occupancy:.2f}</span>'
             f' <span style="color:#555; font-size:0.75rem;">({conf_pct}% conf.)</span><br>'
         )
+    else:
+        eff_occ_html = f'Eff. Occupancy: <span style="color:#fff">{effective_occupancy:.0f}</span> <span style="color:#555; font-size:0.75rem;">(Max Confidence)</span><br>'
 
     # Build per-device watt breakdown for the context card
     ac_draw = AC_ECO_WATTS if (status_ac and status_ac_eco) else (
@@ -856,7 +857,7 @@ with col_c:
 st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
 
-# ── Helper: renders an action/suggestion list as HTML ─────────────────────────
+#  Helper: renders an action/suggestion list as HTML 
 def _actions_html(items, label_map, item_css_class):
     html = ""
     for i, item in enumerate(items, 1):
@@ -946,7 +947,7 @@ elif waste_category == 'MEDIUM WASTE':
 else:
     # HIGH WASTE — behaviour depends on autonomy level and confidence
 
-    # ── Safety override: confidence too low to act ──────────────────────────
+    #  Safety override: confidence too low to act 
     # Checked here (not only in the agent) so the correct panel is shown even
     # when the fuzzy dead zone (effective_occupancy=0.5 at confidence=0) caused
     # the agent to classify LOW/MEDIUM rather than HIGH.  The agent's reasoning
@@ -981,7 +982,7 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
-    # ── Advisory: no execution, show recommendations ────────────────────────
+    #  Advisory: no execution, show recommendations 
     elif autonomy_level == 'advisory':
         adv_html = _actions_html(medium_recs, ADVISORY_LABELS, 'advisory-item') if medium_recs else \
                    '<p style="color:#555; font-size:0.85rem;">No recommendations generated.</p>'
@@ -998,7 +999,7 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
-    # ── Confirm: plan ready, awaiting approval ──────────────────────────────
+    #  Confirm: plan ready, awaiting approval 
     elif awaiting_confirmation:
         col_left, col_right = st.columns([1.2, 1])
 
@@ -1046,7 +1047,7 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
-    # ── Autonomous: STRIPS executed ─────────────────────────────────────────
+    #  Autonomous: STRIPS executed 
     else:
         col_left, col_right = st.columns([1.2, 1])
 
@@ -1220,7 +1221,7 @@ if batch_results:
             )
 
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+#  Footer 
 st.markdown("<div style='height:3rem'></div>", unsafe_allow_html=True)
 st.markdown("""
 <div style="border-top: 1px solid #1e1e1e; padding-top: 1rem;">
